@@ -9,27 +9,44 @@
 export const TEXAS_BBOX = [-106.645646, 25.837377, -93.508039, 36.500704];
 export const TEXAS_CENTER = [-99.2, 31.3];
 
-const GEOCODE_LIMIT = 5;
+const GEOCODE_LIMIT = 3;
+const MAX_QUERIES_PER_PIN = 3;
 
 export async function geocodeSegments(segments, token, { onPin, originText, destinationText } = {}) {
   const enriched = enrichQueriesWithCorridorHints(segments, originText, destinationText);
-  const pins = [];
-  let prevPin = null;
-  for (let i = 0; i < enriched.length; i++) {
+
+  // Pass 1: geocode every pin in parallel (no proximity) — much faster.
+  const rough = await Promise.all(
+    enriched.map((seg, i) => geocodeSegment(seg, token, null, i, {})),
+  );
+
+  // Pass 2: only re-hit weak short-leg pins with proximity from the previous good pin.
+  const pins = [...rough];
+  for (let i = 1; i < pins.length; i++) {
+    const prevSeg = enriched[i - 1];
     const seg = enriched[i];
-    const prevSeg = i > 0 ? enriched[i - 1] : null;
     const expectedMi = expectedLegMiles(prevSeg, seg);
-    // Long permit legs (e.g. IH 45 Houston→Dallas) must NOT bias Mapbox toward the
-    // previous city — that was a major failure mode last time.
-    const proximity =
-      prevPin && expectedMi != null && expectedMi < 35 ? [prevPin.lng, prevPin.lat] : null;
-    const pin = await geocodeSegment(seg, token, proximity, i, {
-      previous: prevPin,
-      expectedMi,
-    });
-    pins.push(pin);
-    if (onPin) onPin(pin, i, enriched.length);
-    if (pin.lng != null && pin.lat != null) prevPin = pin;
+    const prevPin = pins[i - 1];
+    if (
+      pins[i].weak &&
+      prevPin?.lng != null &&
+      expectedMi != null &&
+      expectedMi < 35
+    ) {
+      pins[i] = await geocodeSegment(seg, token, [prevPin.lng, prevPin.lat], i, {
+        previous: prevPin,
+        expectedMi,
+      });
+    } else if (prevPin?.lng != null && pins[i].lng != null && expectedMi != null) {
+      // Re-score distance consistency without another network call when possible.
+      const bonus = distanceConsistencyBonus(prevPin, pins[i], expectedMi);
+      pins[i] = {
+        ...pins[i],
+        score: pins[i].score + bonus,
+        weak: pins[i].score + bonus < 55,
+      };
+    }
+    if (onPin) onPin(pins[i], i, pins.length);
   }
   return pins;
 }
@@ -50,26 +67,21 @@ function enrichQueriesWithCorridorHints(segments, originText, destinationText) {
   );
   return segments.map((seg, i) => {
     const t = segments.length <= 1 ? 0 : i / (segments.length - 1);
-    const hints = t <= 0.45 ? originHints : t >= 0.55 ? destHints : [...originHints, ...destHints];
-    if (!hints.length) return seg;
+    const hints = t <= 0.45 ? originHints : destHints;
+    const hint = hints[0];
     const extra = [];
-    for (const q of seg.queries || []) {
-      for (const h of hints) {
-        if (!new RegExp(h, "i").test(q)) extra.push(`${q.replace(/\bTexas\b/i, `${h} Texas`)}`);
-        extra.push(`${q} ${h}`);
-      }
-    }
     if (seg.roads && seg.roads.length >= 2) {
       const [a, b] = seg.roads;
-      for (const h of hints) {
-        extra.push(`${a} and ${b} ${h} Texas`);
-        extra.push(`${spokenRoad(a)} and ${spokenRoad(b)} ${h} Texas`);
-        extra.push(`${spokenRoad(a)} & ${spokenRoad(b)}, ${h}, TX`);
-      }
+      extra.push(`${a} and ${b} intersection Texas`);
+      extra.push(`${spokenRoad(a)} and ${spokenRoad(b)} Texas`);
+      if (hint) extra.push(`${spokenRoad(a)} and ${spokenRoad(b)} ${hint} Texas`);
+    } else if (seg.queries?.[0]) {
+      extra.push(seg.queries[0]);
+      if (hint) extra.push(`${seg.queries[0]} ${hint}`);
     }
     return {
       ...seg,
-      queries: dedupe([...(seg.queries || []), ...extra]),
+      queries: dedupe([...extra, ...(seg.queries || [])]).slice(0, MAX_QUERIES_PER_PIN),
     };
   });
 }
@@ -147,45 +159,37 @@ function dedupe(arr) {
 }
 
 export async function geocodeSegment(seg, token, proximity, index, opts = {}) {
-  const baseQueries = (seg.queries && seg.queries.length ? seg.queries : [seg.text]).filter(Boolean);
-  const spoken = [];
-  if (seg.roads && seg.roads.length >= 2) {
-    const [a, b] = seg.roads;
-    spoken.push(
-      `${spokenRoad(a)} and ${spokenRoad(b)} Texas`,
-      `${spokenRoad(a)} & ${spokenRoad(b)} Texas`,
-      `${a} and ${b} interchange Texas`,
-    );
-  }
-  const queries = dedupe([...spoken, ...baseQueries]);
-  let best = null;
-  const tried = [];
+  const queries = dedupe(
+    (seg.queries && seg.queries.length ? seg.queries : [seg.text]).filter(Boolean),
+  ).slice(0, MAX_QUERIES_PER_PIN);
 
-  for (const query of queries.slice(0, 10)) {
-    const features = await mapboxGeocode(query, token, proximity);
-    for (const feature of features) {
-      const lng = feature.center?.[0];
-      const lat = feature.center?.[1];
-      let score = scoreFeature(feature, seg);
-      if (opts.previous && lng != null && lat != null && opts.expectedMi != null) {
-        score += distanceConsistencyBonus(
-          opts.previous,
-          { lng, lat },
-          opts.expectedMi,
-        );
-      }
-      const scored = {
-        query,
-        feature,
-        score,
-        place: feature.place_name || feature.text || query,
-        lng,
-        lat,
-      };
-      tried.push(scored);
-      if (!best || scored.score > best.score) best = scored;
-    }
-    if (best && best.score >= 80) break;
+  // Fire the short query list in parallel instead of one-by-one.
+  const batches = await Promise.all(
+    queries.map(async (query) => {
+      const features = await mapboxGeocode(query, token, proximity);
+      return features.map((feature) => {
+        const lng = feature.center?.[0];
+        const lat = feature.center?.[1];
+        let score = scoreFeature(feature, seg);
+        if (opts.previous && lng != null && lat != null && opts.expectedMi != null) {
+          score += distanceConsistencyBonus(opts.previous, { lng, lat }, opts.expectedMi);
+        }
+        return {
+          query,
+          feature,
+          score,
+          place: feature.place_name || feature.text || query,
+          lng,
+          lat,
+        };
+      });
+    }),
+  );
+
+  const tried = batches.flat();
+  let best = null;
+  for (const scored of tried) {
+    if (!best || scored.score > best.score) best = scored;
   }
 
   return {
@@ -205,7 +209,7 @@ export async function geocodeSegment(seg, token, proximity, index, opts = {}) {
     alternatives: tried
       .filter((t) => t !== best && t.lng != null)
       .sort((a, b) => b.score - a.score)
-      .slice(0, 4),
+      .slice(0, 3),
     ok: best?.lng != null && (best.score >= 35 || queries.length === 1),
     weak: !best || best.score < 55,
   };

@@ -74,6 +74,52 @@ textarea {
   gap: 0.5rem;
 }
 
+.settings {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  align-items: end;
+  padding: 0.85rem 1.1rem;
+  background: #edf3ff;
+  border-bottom: 1px solid var(--line);
+}
+
+.settings .field {
+  flex: 1 1 220px;
+  margin: 0;
+}
+
+.btn-block {
+  width: 100%;
+  margin-top: 0.75rem;
+  justify-content: center;
+  text-align: center;
+}
+
+.list.compact li {
+  padding: 0.45rem 0.6rem;
+}
+
+.raw-text {
+  margin-top: 0.85rem;
+  font-size: 0.86rem;
+}
+
+.raw-text summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.raw-text textarea {
+  margin-top: 0.55rem;
+  min-height: 120px;
+}
+
+.raw-text .btn {
+  margin-top: 0.5rem;
+}
+
 .layout {
   display: grid;
   grid-template-columns: minmax(320px, 420px) 1fr;
