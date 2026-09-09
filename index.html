@@ -5,17 +5,14 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <meta name="theme-color" content="#001848" />
   <title>Texas Permit Parser — FleetBord</title>
-  <meta name="description" content="Upload a Texas oversize/overweight permit, parse the driving directions, and route it on a Mapbox map." />
   <meta name="robots" content="noindex, nofollow" />
-
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
-
   <link href="https://api.mapbox.com/mapbox-gl-js/v3.14.0/mapbox-gl.css" rel="stylesheet" />
   <link rel="stylesheet" href="css/app.css" />
-
   <script src="https://api.mapbox.com/mapbox-gl-js/v3.14.0/mapbox-gl.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
 </head>
 <body>
@@ -25,20 +22,17 @@
       <span>FleetBord · <span id="parserVersion">…</span></span>
     </div>
     <div class="topbar-actions">
-      <button type="button" class="btn btn-ghost" id="loadSample">Sample</button>
       <button type="button" class="btn btn-ghost" id="satBtn">Satellite</button>
-      <button type="button" class="btn btn-ghost" id="settingsBtn" aria-expanded="false">Settings</button>
+      <button type="button" class="btn btn-ghost" id="settingsBtn">Settings</button>
     </div>
   </header>
 
   <div id="settingsPanel" class="settings" hidden>
-    <label class="field">
-      Mapbox token
-      <input id="mapboxToken" type="password" autocomplete="off" spellcheck="false" placeholder="pk.…" />
+    <label class="field">Mapbox token
+      <input id="mapboxToken" type="password" autocomplete="off" spellcheck="false" />
     </label>
-    <label class="field">
-      xAI key (optional)
-      <input id="xaiKey" type="password" autocomplete="off" spellcheck="false" placeholder="xai-…" />
+    <label class="field">xAI key (optional)
+      <input id="xaiKey" type="password" autocomplete="off" spellcheck="false" />
     </label>
     <button type="button" class="btn btn-dark" id="saveKeys">Save</button>
   </div>
@@ -48,15 +42,23 @@
       <p id="status" class="status" data-kind="info">Starting…</p>
 
       <section class="panel">
-        <h2>Upload permit</h2>
+        <h2>Upload permit PDF</h2>
         <label class="dropzone" id="dropzone">
-          <strong>Drop photo or PDF</strong>
-          JPEG / PNG / PDF — parses automatically
+          <strong>Drop TxDMV permit PDF</strong>
+          Reads QR / Permit ID automatically, then maps the official route
           <input id="fileInput" type="file" accept="image/jpeg,image/png,image/webp,application/pdf,.pdf" />
         </label>
         <div class="preview" id="preview" hidden>
           <img id="previewImg" alt="Permit preview" />
         </div>
+        <details class="raw-text">
+          <summary>Manual Permit ID (fallback)</summary>
+          <label class="field">TxPROS Permit ID or link
+            <input id="permitId" type="text" autocomplete="off" spellcheck="false"
+              placeholder="Only if QR/PDF ID wasn’t found" />
+          </label>
+          <a id="txprosLink" class="note" href="#" target="_blank" rel="noopener" hidden>Open in TxPROS</a>
+        </details>
       </section>
 
       <section class="panel" id="resultPanel" hidden>
@@ -66,7 +68,7 @@
         <button type="button" class="btn btn-primary btn-block" id="routeBtn" disabled>Show on map</button>
         <details class="raw-text">
           <summary>Edit extracted text</summary>
-          <textarea id="permitText" placeholder="Permit text…"></textarea>
+          <textarea id="permitText"></textarea>
           <button type="button" class="btn" id="reparseBtn">Re-parse</button>
         </details>
       </section>

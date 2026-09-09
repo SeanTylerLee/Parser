@@ -1,8 +1,10 @@
 /**
  * Turn a permit photo or PDF into plain text the TxDMV parser can read.
  * Photos: optional Grok vision (if an xAI key is saved), else Tesseract.
- * PDFs: pdf.js text extraction in the browser.
+ * PDFs: pdf.js text + links + QR scan for TxPROS PermitID.
  */
+
+import { extractPermitId } from "./txpros.js";
 
 const PDFJS_VERSION = "4.10.38";
 const PDFJS_SRC = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${PDFJS_VERSION}/pdf.min.mjs`;
@@ -34,47 +36,97 @@ export function fileKind(file) {
 }
 
 export async function extractTextFromFile(file, { xaiKey, onStatus } = {}) {
+  const result = await inspectPermitFile(file, { xaiKey, onStatus });
+  return result.text || "";
+}
+
+/**
+ * Read a permit photo/PDF and try hard to find the TxPROS PermitID
+ * (QR code, PDF link, or URL in text).
+ */
+export async function inspectPermitFile(file, { xaiKey, onStatus } = {}) {
   const kind = fileKind(file);
   const say = (msg) => onStatus && onStatus(msg);
+  const out = { kind, text: "", permitId: null };
 
   if (kind === "heic") {
     throw new Error("HEIC photos are not readable in the browser. Export as JPEG or PNG and upload that.");
   }
   if (kind === "pdf") {
-    say("Reading PDF text…");
-    return await extractPdfText(file, say);
+    say("Scanning PDF for TxPROS ID…");
+    const pdf = await inspectPdf(file, say);
+    out.text = pdf.text;
+    out.permitId = pdf.permitId;
+    return out;
   }
   if (kind !== "image") {
     throw new Error("Upload a permit photo (JPEG/PNG) or a PDF.");
   }
 
+  // Image: QR first (fast + accurate), then OCR text.
+  if (window.jsQR) {
+    say("Scanning QR code…");
+    try {
+      const { scanPermitQr } = await import("./txpros.js");
+      out.permitId = await scanPermitQr(file);
+    } catch (_) {
+      /* continue */
+    }
+  }
+
   if (xaiKey) {
     try {
       say("Reading permit photo with Grok vision…");
-      return await extractWithGrokVision(file, xaiKey);
+      out.text = await extractWithGrokVision(file, xaiKey);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       say(`Vision read failed (${msg}). Falling back to on-device OCR…`);
     }
   }
-
-  say("Running on-device OCR (this can take 10–30 seconds)…");
-  return await extractWithTesseract(file, say);
+  if (!out.text) {
+    say("Running on-device OCR…");
+    out.text = await extractWithTesseract(file, say);
+  }
+  if (!out.permitId) out.permitId = extractPermitId(out.text);
+  return out;
 }
 
-async function extractPdfText(file, say) {
+async function inspectPdf(file, say) {
   const pdfjs = await import(PDFJS_SRC);
   pdfjs.GlobalWorkerOptions.workerSrc = PDFJS_WORKER;
   const data = new Uint8Array(await file.arrayBuffer());
   const doc = await pdfjs.getDocument({ data }).promise;
   const pages = [];
+  let permitId = null;
+
   for (let i = 1; i <= doc.numPages; i++) {
-    say(`Reading PDF page ${i} of ${doc.numPages}…`);
+    say(`PDF page ${i}/${doc.numPages}…`);
     const page = await doc.getPage(i);
+
+    // 1) Clickable links / annotations (common on TxDMV PDFs with QR landing URL)
+    if (!permitId) {
+      try {
+        const ann = await page.getAnnotations();
+        for (const a of ann) {
+          const url = a.url || a.unsafeUrl || a.dest || "";
+          const id = extractPermitId(String(url));
+          if (id) {
+            permitId = id;
+            break;
+          }
+        }
+      } catch (_) {
+        /* ignore */
+      }
+    }
+
+    // 2) Text content
     const content = await page.getTextContent();
     const lineMap = new Map();
+    const rawChunks = [];
     for (const item of content.items) {
       if (!item.str || !item.transform) continue;
+      rawChunks.push(item.str);
       const y = Math.round(item.transform[5]);
       const x = item.transform[4];
       if (!lineMap.has(y)) lineMap.set(y, []);
@@ -90,9 +142,55 @@ async function extractPdfText(file, say) {
         .replace(/\s+/g, " ")
         .trim(),
     );
-    pages.push(lines.filter(Boolean).join("\n"));
+    const pageText = lines.filter(Boolean).join("\n");
+    pages.push(pageText);
+    if (!permitId) permitId = extractPermitId(pageText) || extractPermitId(rawChunks.join(" "));
+
+    // 3) Render page and scan QR (TxPROS QR encodes PermitID URL)
+    if (!permitId && window.jsQR) {
+      say(`Scanning QR on page ${i}…`);
+      permitId = await scanPdfPageQr(page);
+    }
+
+    if (permitId) {
+      // Still finish text from remaining pages lightly for sidebar, but ID is enough for routing.
+      for (let j = i + 1; j <= doc.numPages; j++) {
+        try {
+          const p2 = await doc.getPage(j);
+          const c2 = await p2.getTextContent();
+          pages.push(
+            c2.items
+              .map((it) => it.str || "")
+              .join(" ")
+              .replace(/\s+/g, " ")
+              .trim(),
+          );
+        } catch (_) {
+          /* ignore */
+        }
+      }
+      break;
+    }
   }
-  return pages.join("\n\n").trim();
+
+  return { text: pages.filter(Boolean).join("\n\n").trim(), permitId };
+}
+
+async function scanPdfPageQr(page) {
+  const base = page.getViewport({ scale: 1 });
+  // Aim for ~1400px wide for QR readability without huge canvases.
+  const scale = Math.min(2.5, 1400 / base.width);
+  const viewport = page.getViewport({ scale });
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.ceil(viewport.width);
+  canvas.height = Math.ceil(viewport.height);
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  await page.render({ canvasContext: ctx, viewport }).promise;
+  const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const code = window.jsQR(imageData.data, canvas.width, canvas.height, {
+    inversionAttempts: "attemptBoth",
+  });
+  return code?.data ? extractPermitId(code.data) : null;
 }
 
 async function fileToJpegDataUrl(file, { maxEdge = 2000, quality = 0.85 } = {}) {

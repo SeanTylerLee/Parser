@@ -117,10 +117,57 @@ export function drawRouteGeoJSON(feature) {
         paint: { "line-color": "#0070f8", "line-width": 4, "line-opacity": 0.95 },
       });
     }
+
+    const coords = feature.geometry.coordinates || [];
+    if (coords.length >= 2) {
+      const bounds = new mapboxgl.LngLatBounds();
+      // Sample for fitBounds speed on long TxPROS polylines.
+      const step = Math.max(1, Math.floor(coords.length / 200));
+      for (let i = 0; i < coords.length; i += step) bounds.extend(coords[i]);
+      bounds.extend(coords[coords.length - 1]);
+      map.fitBounds(bounds, { padding: 56, maxZoom: 12, duration: 600 });
+    }
   };
 
   if (map.isStyleLoaded()) apply();
   else map.once("load", apply);
+}
+
+/** Draw TxPROS official geometry: full polyline + start/end only (no guessed mid pins). */
+export function drawTxprosRoute(route) {
+  if (!map || !route?.coordinates?.length) return;
+  clearMapOverlays();
+  const coords = route.coordinates;
+  const pins = [
+    {
+      label: "Origin",
+      displayText: "TxPROS start",
+      text: "Start",
+      lng: coords[0][0],
+      lat: coords[0][1],
+      place: null,
+      score: 100,
+      weak: false,
+      ok: true,
+    },
+    {
+      label: "Destination",
+      displayText: "TxPROS end",
+      text: "End",
+      lng: coords[coords.length - 1][0],
+      lat: coords[coords.length - 1][1],
+      place: null,
+      score: 100,
+      weak: false,
+      ok: true,
+    },
+  ];
+  drawPins(pins);
+  drawRouteGeoJSON({
+    type: "Feature",
+    properties: { source: "txpros", point_count: coords.length },
+    geometry: { type: "LineString", coordinates: coords },
+  });
 }
 
 function escapeHtml(s) {

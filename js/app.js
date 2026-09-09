@@ -1,31 +1,12 @@
 import { parsePermitText, PARSER_VERSION } from "./tx-permit-parser.js";
-import { extractTextFromFile, fileKind } from "./ocr.js";
-import { geocodeSegments, fetchPermitRoute } from "./geocode.js";
-import { initMap, hasMap, clearMapOverlays, drawPins, drawRouteGeoJSON, setSatellite, isSatellite } from "./map.js";
+import { inspectPermitFile, fileKind } from "./ocr.js";
+import { initMap, hasMap, clearMapOverlays, drawTxprosRoute, setSatellite, isSatellite } from "./map.js";
+import { extractPermitId, fetchTxprosPermit, dirsToText, txprosUrl } from "./txpros.js";
 
 const STORAGE_MAPBOX = "fleetbord.mapboxToken";
 const STORAGE_XAI = "fleetbord.xaiKey";
-
 const DEFAULT_MAPBOX_TOKEN =
   "pk.eyJ1Ijoic2VhbmxlZTkyIiwiYSI6ImNtZTAyeG0wbzAwamgybHE2cmwzenJtM2cifQ.DE8FeoDvc3EzuyR5uPopzA";
-
-const SAMPLE_PERMIT = `Texas Oversize/Overweight Permit
-Permit Number: TEST-260909-01
-
-Origin: Harris County, Houston, TX
-[Loaded Route Origin: IH 10, 0.30 miles west of IH 10 & IH 610]
-Destination: Dallas County, Dallas, TX
-[Loaded Route Destination: US 75, 0.20 miles north of US 75 & IH 635]
-
-Miles Route To Distance Est. Time
-0.30 IH10 e Continue straight 0.30 00:01
-6.20 IH10 e Turn left onto IH610 n 6.50 00:10
-8.40 IH610 n Turn right onto IH45 n 14.90 00:22
-220.10 IH45 n Turn right onto US75 n 235.00 03:35
-15.20 US75 n Arrive at destination 250.20 03:52
-
-Route Conditions:
-* Follow the route listed on this permit.`;
 
 const el = {
   mapboxToken: document.getElementById("mapboxToken"),
@@ -37,19 +18,21 @@ const el = {
   dropzone: document.getElementById("dropzone"),
   preview: document.getElementById("preview"),
   previewImg: document.getElementById("previewImg"),
-  loadSample: document.getElementById("loadSample"),
+  permitId: document.getElementById("permitId"),
   routeBtn: document.getElementById("routeBtn"),
-  reparseBtn: document.getElementById("reparseBtn"),
   satBtn: document.getElementById("satBtn"),
   permitText: document.getElementById("permitText"),
+  reparseBtn: document.getElementById("reparseBtn"),
   status: document.getElementById("status"),
   meta: document.getElementById("meta"),
   steps: document.getElementById("steps"),
   resultPanel: document.getElementById("resultPanel"),
   parserVersion: document.getElementById("parserVersion"),
+  txprosLink: document.getElementById("txprosLink"),
 };
 
 let lastParse = null;
+let lastTxpros = null;
 let busy = false;
 
 function say(msg, kind = "info") {
@@ -67,20 +50,20 @@ function getXaiKey() {
 
 function ensureMap() {
   const token = getMapboxToken();
-  if (!token) throw new Error("Add your Mapbox token in Settings.");
+  if (!token) throw new Error("Add Mapbox token in Settings.");
   if (!hasMap()) initMap(token);
   return token;
 }
 
-function loadKeysIntoForm() {
-  el.mapboxToken.value = localStorage.getItem(STORAGE_MAPBOX) || DEFAULT_MAPBOX_TOKEN;
-  el.xaiKey.value = localStorage.getItem(STORAGE_XAI) || "";
+function setPermitId(id) {
+  if (!id) return;
+  el.permitId.value = id;
+  el.txprosLink.href = txprosUrl(id);
+  el.txprosLink.hidden = false;
 }
 
 el.settingsBtn.addEventListener("click", () => {
-  const open = el.settingsPanel.hidden;
-  el.settingsPanel.hidden = !open;
-  el.settingsBtn.setAttribute("aria-expanded", open ? "true" : "false");
+  el.settingsPanel.hidden = !el.settingsPanel.hidden;
 });
 
 el.saveKeys.addEventListener("click", () => {
@@ -94,30 +77,29 @@ el.saveKeys.addEventListener("click", () => {
   }
 });
 
-function applyParse(text) {
-  lastParse = parsePermitText(text);
-  clearMapOverlays();
-  renderParse(lastParse);
-  el.resultPanel.hidden = false;
-  const nSeg = lastParse.segments.length;
-  el.routeBtn.disabled = !nSeg;
-  return nSeg;
+async function loadOfficialRoute(permitId, { autoMap = true } = {}) {
+  setPermitId(permitId);
+  say(`Loading official TxDMV route for ${permitId}…`);
+  const data = await fetchTxprosPermit(permitId);
+  applyTxpros(data);
+  if (autoMap) {
+    ensureMap();
+    clearMapOverlays();
+    drawTxprosRoute(data.route);
+    say(`Mapped official route · ${data.route.point_count} points`, "ok");
+  }
+  return data;
 }
 
 async function ingestFile(file) {
   if (!file || busy) return;
   const kind = fileKind(file);
-  if (kind === "heic") {
-    say("HEIC not supported — use JPEG or PNG.", "error");
-    return;
-  }
-  if (kind === "unknown") {
-    say("Upload a JPEG/PNG photo or PDF.", "error");
-    return;
-  }
+  if (kind === "heic") return say("Use JPEG/PNG, not HEIC.", "error");
+  if (kind === "unknown") return say("Upload a JPEG/PNG or PDF.", "error");
 
   busy = true;
   el.routeBtn.disabled = true;
+  lastTxpros = null;
   try {
     if (kind === "image") {
       const url = URL.createObjectURL(file);
@@ -128,109 +110,155 @@ async function ingestFile(file) {
       el.preview.hidden = true;
     }
 
-    say(`Reading ${file.name}…`);
-    const text = await extractTextFromFile(file, {
+    const inspected = await inspectPermitFile(file, {
       xaiKey: getXaiKey(),
       onStatus: (m) => say(m),
     });
-    el.permitText.value = text || "";
-    if (!text) {
-      say("Could not read text. Try a clearer photo or PDF.", "error");
+
+    el.permitText.value = inspected.text || "";
+    if (inspected.text) {
+      lastParse = parsePermitText(inspected.text);
+    }
+
+    const permitId =
+      inspected.permitId ||
+      extractPermitId(inspected.text || "") ||
+      extractPermitId(el.permitId.value);
+
+    if (permitId) {
+      await loadOfficialRoute(permitId, { autoMap: true });
       return;
     }
 
-    say("Parsing route…");
-    const nSeg = applyParse(text);
-    say(
-      nSeg
-        ? `Parsed ${nSeg} pin(s). Click Show on map.`
-        : "No route found in that permit. Check Edit extracted text.",
-      nSeg ? "ok" : "error",
-    );
+    // No TxPROS ID found in PDF/photo.
+    if (lastParse?.segments?.length) {
+      renderParse(lastParse, null);
+      el.resultPanel.hidden = false;
+      say(
+        "Could not find TxPROS QR/Permit ID in that file. The PDF needs the QR code or TxPROS link.",
+        "warn",
+      );
+    } else {
+      say("Could not read a TxPROS ID from that upload. Try the original TxDMV PDF.", "error");
+    }
   } catch (err) {
     say(err instanceof Error ? err.message : String(err), "error");
   } finally {
     busy = false;
+    el.routeBtn.disabled = !lastTxpros?.route?.coordinates?.length;
   }
 }
 
-el.loadSample.addEventListener("click", () => {
-  if (busy) return;
-  el.preview.hidden = true;
-  el.fileInput.value = "";
-  el.permitText.value = SAMPLE_PERMIT;
-  const nSeg = applyParse(SAMPLE_PERMIT);
-  say(nSeg ? `Sample parsed (${nSeg} pins). Click Show on map.` : "Sample failed to parse.", nSeg ? "ok" : "error");
-});
+function applyTxpros(data) {
+  lastTxpros = data;
+  setPermitId(String(data.permit_id));
+  if (!el.permitText.value.trim() && data.driving_dirs?.length) {
+    el.permitText.value = dirsToText(data.driving_dirs);
+    lastParse = parsePermitText(el.permitText.value);
+  } else if (el.permitText.value.trim() && !lastParse) {
+    lastParse = parsePermitText(el.permitText.value);
+  }
+  renderParse(lastParse, data);
+  el.resultPanel.hidden = false;
+  el.routeBtn.disabled = !data.route?.coordinates?.length;
+}
+
+function renderParse(result, txpros) {
+  el.meta.innerHTML = "";
+  el.steps.innerHTML = "";
+  const rows = [
+    ["Permit #", txpros?.permit_no || result?.permit_number || "—"],
+    ["TxPROS ID", txpros?.permit_id || "—"],
+    ["Status", txpros?.status || "—"],
+    ["From", result?.origin_text || txpros?.driving_dirs?.[0]?.to || "—"],
+    ["To", result?.destination_text || txpros?.driving_dirs?.at?.(-1)?.to || "—"],
+    ["Points", txpros?.route?.point_count != null ? String(txpros.route.point_count) : "—"],
+  ];
+  for (const [k, v] of rows) {
+    const dt = document.createElement("dt");
+    dt.textContent = k;
+    const dd = document.createElement("dd");
+    dd.textContent = v;
+    el.meta.append(dt, dd);
+  }
+
+  const segs = result?.segments || [];
+  if (!segs.length && txpros?.driving_dirs?.length) {
+    for (const d of txpros.driving_dirs.slice(0, 12)) {
+      const li = document.createElement("li");
+      li.innerHTML = `<span class="tag">Dir</span><span>${escapeHtml(d.route || "")} ${escapeHtml(d.to || "")}</span>`;
+      el.steps.appendChild(li);
+    }
+    return;
+  }
+  for (const seg of segs) {
+    const li = document.createElement("li");
+    li.innerHTML = `<span class="tag">${escapeHtml(seg.label)}</span><span>${escapeHtml(seg.displayText || seg.text)}</span>`;
+    el.steps.appendChild(li);
+  }
+}
 
 el.fileInput.addEventListener("change", () => {
-  const file = el.fileInput.files && el.fileInput.files[0];
-  if (file) ingestFile(file);
+  const f = el.fileInput.files?.[0];
+  if (f) ingestFile(f);
 });
-
-["dragenter", "dragover"].forEach((evt) => {
+["dragenter", "dragover"].forEach((evt) =>
   el.dropzone.addEventListener(evt, (e) => {
     e.preventDefault();
     el.dropzone.classList.add("drag");
-  });
-});
-["dragleave", "drop"].forEach((evt) => {
+  }),
+);
+["dragleave", "drop"].forEach((evt) =>
   el.dropzone.addEventListener(evt, (e) => {
     e.preventDefault();
     el.dropzone.classList.remove("drag");
-  });
-});
+  }),
+);
 el.dropzone.addEventListener("drop", (e) => {
-  const file = e.dataTransfer?.files?.[0];
-  if (file) ingestFile(file);
+  const f = e.dataTransfer?.files?.[0];
+  if (f) ingestFile(f);
 });
 
-el.reparseBtn.addEventListener("click", () => {
+el.reparseBtn?.addEventListener("click", async () => {
   const text = el.permitText.value.trim();
-  if (!text) {
-    say("No text to parse.", "error");
+  if (!text) return;
+  lastParse = parsePermitText(text);
+  const id = extractPermitId(text) || extractPermitId(el.permitId.value);
+  if (id) {
+    try {
+      busy = true;
+      await loadOfficialRoute(id, { autoMap: true });
+    } catch (err) {
+      say(err.message, "error");
+    } finally {
+      busy = false;
+    }
     return;
   }
-  const nSeg = applyParse(text);
-  say(nSeg ? `Re-parsed ${nSeg} pin(s).` : "Still no route pins in that text.", nSeg ? "ok" : "error");
+  renderParse(lastParse, lastTxpros);
+  say("Re-parsed text (no TxPROS ID found).", "warn");
 });
 
 el.routeBtn.addEventListener("click", async () => {
-  if (!lastParse?.segments?.length || busy) return;
+  if (busy) return;
   busy = true;
   el.routeBtn.disabled = true;
   try {
-    const token = ensureMap();
-    say("Geocoding junctions…");
-    const pins = await geocodeSegments(lastParse.segments, token, {
-      originText: lastParse.origin_text,
-      destinationText: lastParse.destination_text,
-      onPin: (pin, i, total) => say(`Pin ${i + 1}/${total}…`),
-    });
-    drawPins(pins);
-
-    const missing = pins.filter((p) => p.lng == null);
-    if (missing.length) {
-      say(`${missing.length} pin(s) failed. Edit text and re-parse.`, "error");
+    ensureMap();
+    if (!lastTxpros?.route?.coordinates?.length) {
+      const id = extractPermitId(el.permitId.value) || extractPermitId(el.permitText.value);
+      if (!id) throw new Error("Upload a TxDMV PDF (with QR) first.");
+      await loadOfficialRoute(id, { autoMap: true });
       return;
     }
-
-    say("Drawing route…");
-    const route = await fetchPermitRoute(pins, token);
-    drawRouteGeoJSON(route);
-    const permitMi = lastParse.steps.map((s) => s.permit_odometer_mi).filter((n) => n != null).pop();
-    const mapMi = route.properties.distance_mi;
-    const note =
-      permitMi != null
-        ? `Map ${mapMi.toFixed(0)} mi · permit ${permitMi.toFixed(0)} mi`
-        : `Map ${mapMi.toFixed(0)} mi`;
-    const weak = pins.filter((p) => p.weak).length;
-    say(weak ? `${note} · ${weak} weak pin(s)` : note, weak ? "warn" : "ok");
+    clearMapOverlays();
+    drawTxprosRoute(lastTxpros.route);
+    say(`Mapped official route · ${lastTxpros.route.point_count} points`, "ok");
   } catch (err) {
     say(err instanceof Error ? err.message : String(err), "error");
   } finally {
     busy = false;
-    el.routeBtn.disabled = !lastParse?.segments?.length;
+    el.routeBtn.disabled = !lastTxpros?.route?.coordinates?.length;
   }
 });
 
@@ -244,36 +272,6 @@ el.satBtn.addEventListener("click", () => {
   }
 });
 
-function renderParse(result) {
-  el.meta.innerHTML = "";
-  el.steps.innerHTML = "";
-
-  const rows = [
-    ["Permit", result.permit_number || "—"],
-    ["From", result.origin_text || "—"],
-    ["To", result.destination_text || "—"],
-  ];
-  for (const [k, v] of rows) {
-    const dt = document.createElement("dt");
-    dt.textContent = k;
-    const dd = document.createElement("dd");
-    dd.textContent = v;
-    el.meta.append(dt, dd);
-  }
-
-  if (!result.segments.length) {
-    el.steps.innerHTML = `<li class="empty">No route pins found.</li>`;
-    return;
-  }
-
-  for (const seg of result.segments) {
-    const li = document.createElement("li");
-    li.innerHTML = `<span class="tag">${escapeHtml(seg.label)}</span>
-      <span>${escapeHtml(seg.displayText || seg.text)}</span>`;
-    el.steps.appendChild(li);
-  }
-}
-
 function escapeHtml(s) {
   return String(s || "")
     .replace(/&/g, "&amp;")
@@ -283,13 +281,13 @@ function escapeHtml(s) {
 }
 
 el.parserVersion.textContent = PARSER_VERSION;
-loadKeysIntoForm();
-if (!localStorage.getItem(STORAGE_MAPBOX)) {
-  localStorage.setItem(STORAGE_MAPBOX, DEFAULT_MAPBOX_TOKEN);
-}
+el.mapboxToken.value = localStorage.getItem(STORAGE_MAPBOX) || DEFAULT_MAPBOX_TOKEN;
+el.xaiKey.value = localStorage.getItem(STORAGE_XAI) || "";
+if (!localStorage.getItem(STORAGE_MAPBOX)) localStorage.setItem(STORAGE_MAPBOX, DEFAULT_MAPBOX_TOKEN);
+
 try {
   initMap(getMapboxToken());
-  say("Drop a permit or click Sample.");
+  say("Upload a Texas permit PDF — we’ll read the QR/ID and map the official route.");
 } catch (err) {
   say(`Map failed: ${err.message}`, "error");
 }
