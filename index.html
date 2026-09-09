@@ -1,9 +1,109 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>My Website</title>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#001848" />
+  <title>Texas Permit Parser — FleetBord</title>
+  <meta name="description" content="Upload a Texas oversize/overweight permit, parse the driving directions, and route it on a Mapbox map." />
+  <meta name="robots" content="noindex, nofollow" />
+
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+
+  <link href="https://api.mapbox.com/mapbox-gl-js/v3.14.0/mapbox-gl.css" rel="stylesheet" />
+  <link rel="stylesheet" href="css/app.css" />
+
+  <script src="https://api.mapbox.com/mapbox-gl-js/v3.14.0/mapbox-gl.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
 </head>
 <body>
-    <h1>Hello World! My website is coming soon.</h1>
+  <header class="topbar">
+    <div class="brand">
+      <strong>Texas Permit Parser</strong>
+      <span>FleetBord test bench · parser <span id="parserVersion">…</span></span>
+    </div>
+    <div class="topbar-actions">
+      <button type="button" class="btn btn-ghost" id="loadSample">Load sample</button>
+      <button type="button" class="btn btn-ghost" id="satBtn">Satellite</button>
+    </div>
+  </header>
+
+  <div class="layout">
+    <aside class="sidebar">
+      <p id="status" class="status" data-kind="info">Starting…</p>
+
+      <section class="panel">
+        <h2>1. Keys</h2>
+        <label class="field">
+          Mapbox token
+          <input id="mapboxToken" type="password" autocomplete="off" spellcheck="false" placeholder="pk.…" />
+        </label>
+        <label class="field" style="margin-top:0.55rem">
+          xAI key (optional — better photo reading)
+          <input id="xaiKey" type="password" autocomplete="off" spellcheck="false" placeholder="xai-…" />
+        </label>
+        <div class="row" style="margin-top:0.65rem">
+          <button type="button" class="btn btn-dark" id="saveKeys">Save keys</button>
+        </div>
+        <p class="note">Mapbox public tokens (`pk.`) belong in the browser. Restrict this token to your domains in the Mapbox dashboard. The xAI key is only stored in this browser’s localStorage.</p>
+      </section>
+
+      <section class="panel">
+        <h2>2. Upload permit</h2>
+        <label class="dropzone" id="dropzone">
+          <strong>Drop a Texas OS/OW photo or PDF</strong>
+          JPEG / PNG / PDF · photos of the printed route table work best
+          <input id="fileInput" type="file" accept="image/jpeg,image/png,image/webp,application/pdf,.pdf" />
+        </label>
+        <div class="preview" id="preview" hidden>
+          <img id="previewImg" alt="Permit preview" />
+          <div class="row" style="margin-top:0.5rem">
+            <button type="button" class="btn" id="clearFile">Clear file</button>
+          </div>
+        </div>
+        <div class="row" style="margin-top:0.7rem">
+          <button type="button" class="btn btn-primary" id="extractBtn">Extract text</button>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>3. Review / edit text</h2>
+        <p class="note">This is the critical step. Last time we failed partly because bad OCR went straight into routing. Fix the turn table here before parsing.</p>
+        <textarea id="permitText" placeholder="Permit text appears here after extract, or paste it manually…"></textarea>
+        <div class="row" style="margin-top:0.65rem">
+          <button type="button" class="btn btn-primary" id="parseBtn">Parse</button>
+          <button type="button" class="btn btn-dark" id="routeBtn">Route on map</button>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>4. Parsed permit</h2>
+        <dl class="meta" id="meta"></dl>
+      </section>
+
+      <section class="panel">
+        <h2>Turn table</h2>
+        <ul class="list" id="steps">
+          <li class="empty">Nothing parsed yet.</li>
+        </ul>
+      </section>
+
+      <section class="panel">
+        <h2>Map pins</h2>
+        <ul class="list" id="pins">
+          <li class="empty">Pins show after Parse / Route.</li>
+        </ul>
+        <p class="note">Disclaimer: this is a routing test tool. Always follow the paper permit — Mapbox may still shortcut between pins if a junction is geocoded wrong.</p>
+      </section>
+    </aside>
+
+    <main class="map-pane">
+      <div id="map" role="region" aria-label="Permit route map"></div>
+    </main>
+  </div>
+
+  <script type="module" src="js/app.js"></script>
 </body>
 </html>
