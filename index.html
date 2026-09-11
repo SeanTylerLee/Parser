@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <meta name="theme-color" content="#001848" />
-  <title>Texas Permit Parser — FleetBord</title>
+  <title>Permit Parser — FleetBord</title>
   <meta name="robots" content="noindex, nofollow" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -18,40 +18,43 @@
 <body>
   <header class="topbar">
     <div class="brand">
-      <strong>Texas Permit Parser</strong>
+      <strong id="brandTitle">Permit Parser</strong>
       <span>FleetBord · <span id="parserVersion">…</span></span>
     </div>
     <div class="topbar-actions">
       <button type="button" class="btn btn-ghost" id="satBtn">Satellite</button>
-      <button type="button" class="btn btn-ghost" id="settingsBtn">Settings</button>
     </div>
   </header>
 
-  <div id="settingsPanel" class="settings" hidden>
-    <label class="field">Mapbox token
-      <input id="mapboxToken" type="password" autocomplete="off" spellcheck="false" />
-    </label>
-    <label class="field">xAI key (optional)
-      <input id="xaiKey" type="password" autocomplete="off" spellcheck="false" />
-    </label>
-    <button type="button" class="btn btn-dark" id="saveKeys">Save</button>
-  </div>
-
   <div class="layout">
     <aside class="sidebar">
-      <p id="status" class="status" data-kind="info">Starting…</p>
+      <p id="status" class="status" data-kind="info">1) Upload a permit · 2) Parse · 3) Show on map</p>
 
       <section class="panel">
-        <h2>Upload permit PDF</h2>
-        <label class="dropzone" id="dropzone">
-          <strong>Drop TxDMV permit PDF</strong>
-          Reads QR / Permit ID automatically, then maps the official route
-          <input id="fileInput" type="file" accept="image/jpeg,image/png,image/webp,application/pdf,.pdf" />
+        <h2>Steps</h2>
+
+        <label class="field state-field">State
+          <select id="stateSelect">
+            <option value="TX">Texas</option>
+            <option value="OK">Oklahoma</option>
+          </select>
         </label>
+
+        <div class="actions">
+          <button type="button" class="btn btn-dark btn-block" id="uploadBtn">1. Upload</button>
+          <input id="fileInput" type="file" accept="image/jpeg,image/png,image/webp,application/pdf,.pdf" hidden />
+
+          <p id="fileLabel" class="file-label">No file selected</p>
+
+          <button type="button" class="btn btn-primary btn-block" id="parseBtn" disabled>2. Parse</button>
+          <button type="button" class="btn btn-primary btn-block" id="routeBtn" disabled>3. Show on map</button>
+        </div>
+
         <div class="preview" id="preview" hidden>
           <img id="previewImg" alt="Permit preview" />
         </div>
-        <details class="raw-text">
+
+        <details class="raw-text" id="txFallback">
           <summary>Manual Permit ID (fallback)</summary>
           <label class="field">TxPROS Permit ID or link
             <input id="permitId" type="text" autocomplete="off" spellcheck="false"
@@ -65,11 +68,10 @@
         <h2>Route</h2>
         <dl class="meta" id="meta"></dl>
         <ul class="list compact" id="steps"></ul>
-        <button type="button" class="btn btn-primary btn-block" id="routeBtn" disabled>Show on map</button>
         <details class="raw-text">
           <summary>Edit extracted text</summary>
           <textarea id="permitText"></textarea>
-          <button type="button" class="btn" id="reparseBtn">Re-parse</button>
+          <button type="button" class="btn" id="reparseBtn">Re-parse text</button>
         </details>
       </section>
     </aside>
@@ -79,6 +81,6 @@
     </main>
   </div>
 
-  <script type="module" src="js/app.js"></script>
+  <script type="module" src="js/app.js?v=ok10-line"></script>
 </body>
 </html>

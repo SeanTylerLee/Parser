@@ -9,6 +9,9 @@
 export const TEXAS_BBOX = [-106.645646, 25.837377, -93.508039, 36.500704];
 export const TEXAS_CENTER = [-99.2, 31.3];
 
+export const OKLAHOMA_BBOX = [-103.002455, 33.615833, -94.430662, 37.002312];
+export const OKLAHOMA_CENTER = [-97.5, 35.5];
+
 const GEOCODE_LIMIT = 3;
 const MAX_QUERIES_PER_PIN = 3;
 

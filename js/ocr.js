@@ -44,7 +44,7 @@ export async function extractTextFromFile(file, { xaiKey, onStatus } = {}) {
  * Read a permit photo/PDF and try hard to find the TxPROS PermitID
  * (QR code, PDF link, or URL in text).
  */
-export async function inspectPermitFile(file, { xaiKey, onStatus } = {}) {
+export async function inspectPermitFile(file, { xaiKey, onStatus, fullText = false } = {}) {
   const kind = fileKind(file);
   const say = (msg) => onStatus && onStatus(msg);
   const out = { kind, text: "", permitId: null };
@@ -53,8 +53,8 @@ export async function inspectPermitFile(file, { xaiKey, onStatus } = {}) {
     throw new Error("HEIC photos are not readable in the browser. Export as JPEG or PNG and upload that.");
   }
   if (kind === "pdf") {
-    say("Scanning PDF for TxPROS ID…");
-    const pdf = await inspectPdf(file, say);
+    say(fullText ? "Reading full permit PDF…" : "Scanning PDF for TxPROS ID…");
+    const pdf = await inspectPdf(file, say, { fullText });
     out.text = pdf.text;
     out.permitId = pdf.permitId;
     return out;
@@ -91,7 +91,7 @@ export async function inspectPermitFile(file, { xaiKey, onStatus } = {}) {
   return out;
 }
 
-async function inspectPdf(file, say) {
+async function inspectPdf(file, say, { fullText = false } = {}) {
   const pdfjs = await import(PDFJS_SRC);
   pdfjs.GlobalWorkerOptions.workerSrc = PDFJS_WORKER;
   const data = new Uint8Array(await file.arrayBuffer());
@@ -104,7 +104,7 @@ async function inspectPdf(file, say) {
     const page = await doc.getPage(i);
 
     // 1) Clickable links / annotations (common on TxDMV PDFs with QR landing URL)
-    if (!permitId) {
+    if (!fullText && !permitId) {
       try {
         const ann = await page.getAnnotations();
         for (const a of ann) {
@@ -120,51 +120,28 @@ async function inspectPdf(file, say) {
       }
     }
 
-    // 2) Text content
-    const content = await page.getTextContent();
-    const lineMap = new Map();
-    const rawChunks = [];
-    for (const item of content.items) {
-      if (!item.str || !item.transform) continue;
-      rawChunks.push(item.str);
-      const y = Math.round(item.transform[5]);
-      const x = item.transform[4];
-      if (!lineMap.has(y)) lineMap.set(y, []);
-      lineMap.get(y).push({ x, str: item.str });
-    }
-    const ys = [...lineMap.keys()].sort((a, b) => b - a);
-    const lines = ys.map((y) =>
-      lineMap
-        .get(y)
-        .sort((a, b) => a.x - b.x)
-        .map((t) => t.str)
-        .join(" ")
-        .replace(/\s+/g, " ")
-        .trim(),
-    );
-    const pageText = lines.filter(Boolean).join("\n");
+    // 2) Text content (line-aware — needed for Oklahoma field wraps)
+    const pageText = await pageTextLineAware(page);
     pages.push(pageText);
-    if (!permitId) permitId = extractPermitId(pageText) || extractPermitId(rawChunks.join(" "));
+    if (!fullText && !permitId) {
+      const content = await page.getTextContent();
+      const rawChunks = content.items.map((it) => it.str || "").join(" ");
+      permitId = extractPermitId(pageText) || extractPermitId(rawChunks);
+    }
 
     // 3) Render page and scan QR (TxPROS QR encodes PermitID URL)
-    if (!permitId && window.jsQR) {
+    if (!fullText && !permitId && window.jsQR) {
       say(`Scanning QR on page ${i}…`);
       permitId = await scanPdfPageQr(page);
     }
 
-    if (permitId) {
-      // Still finish text from remaining pages lightly for sidebar, but ID is enough for routing.
+    // Texas shortcut: once TxPROS ID is found, skim remaining pages.
+    // Oklahoma (fullText) always reads every page line-aware (directions span pages).
+    if (!fullText && permitId) {
       for (let j = i + 1; j <= doc.numPages; j++) {
         try {
           const p2 = await doc.getPage(j);
-          const c2 = await p2.getTextContent();
-          pages.push(
-            c2.items
-              .map((it) => it.str || "")
-              .join(" ")
-              .replace(/\s+/g, " ")
-              .trim(),
-          );
+          pages.push(await pageTextLineAware(p2));
         } catch (_) {
           /* ignore */
         }
@@ -174,6 +151,29 @@ async function inspectPdf(file, say) {
   }
 
   return { text: pages.filter(Boolean).join("\n\n").trim(), permitId };
+}
+
+async function pageTextLineAware(page) {
+  const content = await page.getTextContent();
+  const lineMap = new Map();
+  for (const item of content.items) {
+    if (!item.str || !item.transform) continue;
+    const y = Math.round(item.transform[5]);
+    const x = item.transform[4];
+    if (!lineMap.has(y)) lineMap.set(y, []);
+    lineMap.get(y).push({ x, str: item.str });
+  }
+  const ys = [...lineMap.keys()].sort((a, b) => b - a);
+  const lines = ys.map((y) =>
+    lineMap
+      .get(y)
+      .sort((a, b) => a.x - b.x)
+      .map((t) => t.str)
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim(),
+  );
+  return lines.filter(Boolean).join("\n");
 }
 
 async function scanPdfPageQr(page) {
