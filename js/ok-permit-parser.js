@@ -7,7 +7,7 @@
  * - "(Outbound)" suffixes, multi-page direction tables
  */
 
-export const OK_PARSER_VERSION = "ok-directions-v3";
+export const OK_PARSER_VERSION = "ok-directions-v4";
 
 const PERMIT_NO_RE = /Permit\s*Number:\s*(\d{10,})/i;
 const APPROX_MI_RE = /Approximate\s*Mileage:\s*([\d.]+)\s*mi/i;
@@ -106,27 +106,21 @@ function extractEndpoint(text, label) {
   const m = labelRe.exec(flat);
   if (!m) return null;
 
-  // Look ahead far enough that [lat,lng] still counts even if "Starting State:"
-  // sits between the label and the coordinates (common pdf.js line wrap).
-  const window = flat.slice(m.index, m.index + m[0].length + 450);
-  const coords = COORDS_RE.exec(window.slice(m[0].length));
-
+  // Only read until the next labeled field. Never steal coords from a later
+  // field (e.g. Going To must not pick up Starting From's [lat,lng]).
   let rest = flat.slice(m.index + m[0].length).trim();
   const cut2 = rest.match(NEXT_FIELD_RE);
-  let placeSource = cut2 ? rest.slice(0, cut2.index) : rest;
-  if (coords) {
-    // Prefer text before the bracket pair in the window
-    const before = window.slice(m[0].length, m[0].length + coords.index);
-    const cutInBefore = before.match(NEXT_FIELD_RE);
-    placeSource = (cutInBefore ? before.slice(0, cutInBefore.index) : before) || placeSource;
-  }
+  let placeSource = cut2 ? rest.slice(0, cut2.index) : rest.slice(0, 450);
 
+  // Coords count only if they sit inside this field's own text.
+  const coords = COORDS_RE.exec(placeSource);
   let lat = null;
   let lng = null;
   if (coords) {
     const parsed = parseLatLng(coords[1], coords[2]);
     lat = parsed.lat;
     lng = parsed.lng;
+    placeSource = placeSource.slice(0, coords.index);
   }
 
   let placeText = String(placeSource || "")
@@ -185,7 +179,7 @@ function annotateStep(leg_miles, instruction) {
   }
 
   const roadMatch = instruction.match(
-    /\b(?:onto|on)\s+((?:I|IH|US|OK|SH)\s*-?\s*\d+[A-Z]?(?:\s*Alt(?:\s*[NS])?)?|[A-Za-z][A-Za-z0-9 .'-]{2,40}?)(?:\s*\(|\s+(?:NB|SB|EB|WB)\b|$)/i,
+    /\b(?:onto|on)\s+((?:I|IH|US|OK|SH)\s*-?\s*\d+[A-Z]?(?:\s*Alt(?:\s*[NS])?)?|[A-Za-z][A-Za-z0-9 .'-]{2,40}?)(?:\s*\(|\s+(?:NB|SB|EB|WB|[NSEW])\b|$)/i,
   );
   let road = null;
   if (roadMatch) road = normalizeRoad(roadMatch[1]);
@@ -194,12 +188,21 @@ function annotateStep(leg_miles, instruction) {
     if (fallback) road = normalizeRoad(fallback[1]);
   }
 
-  const compassMatch = COMPASS_RE.exec(instruction);
-  let compass = compassMatch ? compassMatch[1].toUpperCase() : null;
-  if (compass === "NORTH") compass = "NB";
-  if (compass === "SOUTH") compass = "SB";
-  if (compass === "EAST") compass = "EB";
-  if (compass === "WEST") compass = "WB";
+  // Prefer direction attached to the highway: "I-40 W", "OK-6 NB", "US-81 SB".
+  // Parentheticals like "(OK-34 S)" must NOT steal the travel direction.
+  let compass = null;
+  const hwyDir = instruction.match(
+    /\b(?:I|IH|US|OK|SH)\s*-?\s*\d+[A-Z]?\s+(NB|SB|EB|WB|NORTH|SOUTH|EAST|WEST|[NSEW])\b/i,
+  );
+  if (hwyDir) compass = hwyDir[1].toUpperCase();
+  else {
+    const trail = instruction.match(/\b(NB|SB|EB|WB)\b/i);
+    if (trail) compass = trail[1].toUpperCase();
+  }
+  if (compass === "N" || compass === "NORTH") compass = "NB";
+  if (compass === "S" || compass === "SOUTH") compass = "SB";
+  if (compass === "E" || compass === "EAST") compass = "EB";
+  if (compass === "W" || compass === "WEST") compass = "WB";
 
   return {
     leg_miles,

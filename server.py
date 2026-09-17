@@ -102,6 +102,139 @@ def txpros_fetch(permit_id: int) -> dict:
     }
 
 
+OK_LRS_URL = (
+    "https://services6.arcgis.com/RBtoEUQ2lmN0K3GY/arcgis/rest/services/"
+    "OKRoads_LRS/FeatureServer/0/query"
+)
+
+
+def ok_lrs_fetch(routes: list[str], bbox: list[float]) -> dict:
+    """Fetch ODOT LRS centerlines for route codes inside a WGS84 bbox.
+
+    bbox = [west, south, east, north]
+    routes = ['U081', 'I040', 'S034', ...]
+    """
+    if not routes:
+        return {"ok": False, "error": "Pass ?routes=U081,I040"}
+    if len(bbox) != 4:
+        return {"ok": False, "error": "Pass ?bbox=west,south,east,north"}
+
+    # Pad bbox so mid-route jogs are included.
+    pad = 0.15
+    west, south, east, north = bbox
+    west -= pad
+    south -= pad
+    east += pad
+    north += pad
+
+    quoted = ",".join("'" + re.sub(r"[^A-Za-z0-9]", "", r) + "'" for r in routes)
+    where = f"ODOTROUTE IN ({quoted})"
+    params = urllib.parse.urlencode(
+        {
+            "where": where,
+            "geometry": f"{west},{south},{east},{north}",
+            "geometryType": "esriGeometryEnvelope",
+            "inSR": "4326",
+            "spatialRel": "esriSpatialRelIntersects",
+            "outFields": "ODOTROUTE,MLENGTH",
+            "returnGeometry": "true",
+            "outSR": "4326",
+            "f": "geojson",
+        }
+    )
+    req = urllib.request.Request(
+        f"{OK_LRS_URL}?{params}",
+        headers={"User-Agent": UA, "Accept": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=60) as res:
+        gj = json.loads(res.read().decode("utf-8"))
+
+    by_route: dict[str, list] = {r: [] for r in routes}
+    for feat in gj.get("features") or []:
+        props = feat.get("properties") or {}
+        code = props.get("ODOTROUTE")
+        geom = feat.get("geometry") or {}
+        gtype = geom.get("type")
+        coords = geom.get("coordinates") or []
+        lines = []
+        if gtype == "LineString":
+            lines = [coords]
+        elif gtype == "MultiLineString":
+            lines = coords
+        if code in by_route:
+            for line in lines:
+                # GeoJSON is [lng, lat]
+                cleaned = [[float(p[0]), float(p[1])] for p in line if len(p) >= 2]
+                if len(cleaned) >= 2:
+                    by_route[code].append(cleaned)
+
+    return {
+        "ok": True,
+        "routes": {k: v for k, v in by_route.items() if v},
+        "bbox": [west, south, east, north],
+    }
+
+
+SAFEHAUL_VIEWER = (
+    "https://permitmanager.okladot.state.ok.us/safehaul/permitting/services/"
+    "permitinfo/PermitViewer/"
+)
+SAFEHAUL_PDF = (
+    "https://permitmanager.okladot.state.ok.us/safehaul/permitting/services/"
+    "permitinfo/PermitViewer/PermitViewer/DownloadPdf"
+)
+
+
+def safehaul_fetch(permit_no: str) -> dict:
+    """Scrape OK SafeHaul PermitViewer details for a permit number."""
+    pid = re.sub(r"\D", "", str(permit_no or ""))
+    if len(pid) < 10:
+        return {"ok": False, "error": "Pass a full Oklahoma permit number"}
+
+    viewer_url = f"{SAFEHAUL_VIEWER}?id={pid}&v="
+    req = urllib.request.Request(
+        viewer_url,
+        headers={"User-Agent": UA, "Accept": "text/html"},
+    )
+    with urllib.request.urlopen(req, timeout=45) as res:
+        html = res.read().decode("utf-8", "ignore")
+
+    def cell(label: str) -> str | None:
+        m = re.search(
+            rf"<th>\s*{re.escape(label)}\s*</th>\s*<td>\s*(.*?)\s*</td>",
+            html,
+            re.I | re.S,
+        )
+        if not m:
+            return None
+        return re.sub(r"<[^>]+>", "", m.group(1)).strip()
+
+    origin = cell("Origin") or ""
+    dest = cell("Destination") or ""
+    coords = None
+    cm = re.search(r"\[\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\]", origin)
+    if cm:
+        a, b = float(cm.group(1)), float(cm.group(2))
+        # printed [lat,lng]
+        lat, lng = (a, b) if abs(a) <= 90 else (b, a)
+        coords = {"lat": lat, "lng": lng}
+
+    return {
+        "ok": True,
+        "permit_number": pid,
+        "status": cell("Status"),
+        "start_date": cell("Start Date"),
+        "end_date": cell("End Date"),
+        "company": cell("Company Name"),
+        "origin": origin,
+        "destination": dest,
+        "origin_coords": coords,
+        "safe_route": cell("Safe Route"),
+        "viewer_url": viewer_url,
+        "pdf_url": f"{SAFEHAUL_PDF}?id={pid}",
+    }
+
+
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(ROOT), **kwargs)
@@ -124,7 +257,45 @@ class Handler(SimpleHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/api/txpros/permit":
             return self._txpros(parsed)
+        if parsed.path == "/api/ok/lrs":
+            return self._ok_lrs(parsed)
+        if parsed.path == "/api/ok/safehaul":
+            return self._ok_safehaul(parsed)
         return super().do_GET()
+
+    def _ok_safehaul(self, parsed):
+        qs = parse_qs(parsed.query)
+        raw = (qs.get("id") or qs.get("permit") or qs.get("permitNumber") or [""])[0]
+        try:
+            payload = safehaul_fetch(raw)
+            status = 200 if payload.get("ok") else 400
+            return self._json(status, payload)
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", "ignore")[:300]
+            return self._json(502, {"ok": False, "error": f"SafeHaul HTTP {e.code}", "detail": body})
+        except Exception as e:
+            return self._json(502, {"ok": False, "error": str(e)})
+
+    def _ok_lrs(self, parsed):
+        qs = parse_qs(parsed.query)
+        routes_raw = (qs.get("routes") or [""])[0]
+        bbox_raw = (qs.get("bbox") or [""])[0]
+        routes = [r.strip().upper() for r in routes_raw.split(",") if r.strip()]
+        try:
+            bbox = [float(x) for x in bbox_raw.split(",")]
+        except ValueError:
+            bbox = []
+        if len(bbox) != 4:
+            return self._json(400, {"ok": False, "error": "Pass ?bbox=west,south,east,north&routes=U081"})
+        try:
+            payload = ok_lrs_fetch(routes, bbox)
+            status = 200 if payload.get("ok") else 400
+            return self._json(status, payload)
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", "ignore")[:300]
+            return self._json(502, {"ok": False, "error": f"ODOT LRS HTTP {e.code}", "detail": body})
+        except Exception as e:
+            return self._json(502, {"ok": False, "error": str(e)})
 
     def _txpros(self, parsed):
         qs = parse_qs(parsed.query)
@@ -162,6 +333,8 @@ if __name__ == "__main__":
     server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     print(f"Serving {ROOT} at http://127.0.0.1:{PORT}/")
     print("TxPROS proxy: /api/txpros/permit?id=15256348")
+    print("OK LRS proxy: /api/ok/lrs?routes=U081&bbox=west,south,east,north")
+    print("OK SafeHaul: /api/ok/safehaul?id=20260003543389")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

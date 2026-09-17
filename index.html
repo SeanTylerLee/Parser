@@ -33,12 +33,13 @@
       <section class="panel">
         <h2>Steps</h2>
 
-        <label class="field state-field">State
-          <select id="stateSelect">
-            <option value="TX">Texas</option>
-            <option value="OK">Oklahoma</option>
-          </select>
-        </label>
+        <div class="state-field" role="group" aria-label="State">
+          <span class="state-label">State</span>
+          <div class="state-toggle">
+            <button type="button" class="btn state-btn is-active" id="txStateBtn" data-state="TX" aria-pressed="true">Texas</button>
+            <button type="button" class="btn state-btn" id="okStateBtn" data-state="OK" aria-pressed="false">Oklahoma</button>
+          </div>
+        </div>
 
         <div class="actions">
           <button type="button" class="btn btn-dark btn-block" id="uploadBtn">1. Upload</button>
@@ -81,6 +82,6 @@
     </main>
   </div>
 
-  <script type="module" src="js/app.js?v=ok10-line"></script>
+  <script type="module" src="js/app.js?v=ok24-destfix"></script>
 </body>
 </html>

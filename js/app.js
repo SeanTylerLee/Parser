@@ -11,13 +11,14 @@ import {
 } from "./map.js";
 import { extractPermitId, fetchTxprosPermit, dirsToText, txprosUrl } from "./txpros.js";
 import { parseOkPermitText, OK_PARSER_VERSION, looksLikeOkPermit } from "./ok-permit-parser.js";
-import { buildOkRoute } from "./ok-route.js";
+import { buildOkRoute, fetchSafehaulPermit, safehaulViewerUrl } from "./ok-route.js";
 
 const MAPBOX_TOKEN =
   "pk.eyJ1Ijoic2VhbmxlZTkyIiwiYSI6ImNtZTAyeG0wbzAwamgybHE2cmwzenJtM2cifQ.DE8FeoDvc3EzuyR5uPopzA";
 
 const el = {
-  stateSelect: document.getElementById("stateSelect"),
+  txStateBtn: document.getElementById("txStateBtn"),
+  okStateBtn: document.getElementById("okStateBtn"),
   brandTitle: document.getElementById("brandTitle"),
   uploadBtn: document.getElementById("uploadBtn"),
   fileInput: document.getElementById("fileInput"),
@@ -44,9 +45,18 @@ let lastParse = null; // TX turntable or OK parse
 let lastTxpros = null;
 let lastOkRoute = null;
 let busy = false;
+let selectedState = "TX";
 
 function currentState() {
-  return el.stateSelect.value === "OK" ? "OK" : "TX";
+  return selectedState === "OK" ? "OK" : "TX";
+}
+
+function setSelectedState(next) {
+  selectedState = next === "OK" ? "OK" : "TX";
+  el.txStateBtn.classList.toggle("is-active", selectedState === "TX");
+  el.okStateBtn.classList.toggle("is-active", selectedState === "OK");
+  el.txStateBtn.setAttribute("aria-pressed", selectedState === "TX" ? "true" : "false");
+  el.okStateBtn.setAttribute("aria-pressed", selectedState === "OK" ? "true" : "false");
 }
 
 function say(msg, kind = "info") {
@@ -111,7 +121,16 @@ function applyStateUi() {
   const st = currentState();
   el.brandTitle.textContent = st === "OK" ? "Oklahoma Permit Parser" : "Texas Permit Parser";
   el.parserVersion.textContent = st === "OK" ? OK_PARSER_VERSION : TX_PARSER_VERSION;
-  el.txFallback.hidden = st !== "TX";
+  el.txFallback.hidden = false;
+  const sum = el.txFallback.querySelector("summary");
+  if (sum) {
+    sum.textContent =
+      st === "OK" ? "SafeHaul / Permit ID" : "Manual Permit ID (fallback)";
+  }
+  if (el.txprosLink) {
+    el.txprosLink.textContent = st === "OK" ? "Open in SafeHaul" : "Open in TxPROS";
+    el.txprosLink.hidden = true;
+  }
   clearAll();
   say(
     st === "OK"
@@ -120,7 +139,9 @@ function applyStateUi() {
   );
 }
 
-el.stateSelect.addEventListener("change", () => {
+function onStateButtonClick(next) {
+  if (busy || currentState() === next) return;
+  setSelectedState(next);
   applyStateUi();
   try {
     ensureMap();
@@ -128,7 +149,10 @@ el.stateSelect.addEventListener("change", () => {
   } catch (err) {
     say(err.message, "error");
   }
-});
+}
+
+el.txStateBtn.addEventListener("click", () => onStateButtonClick("TX"));
+el.okStateBtn.addEventListener("click", () => onStateButtonClick("OK"));
 
 el.uploadBtn.addEventListener("click", () => {
   el.fileInput.click();
@@ -240,7 +264,7 @@ async function runParseOk() {
     }
 
     if (!looksLikeOkPermit(inspected.text)) {
-      say("This does not look like an Oklahoma ODOT permit. Check the State dropdown.", "warn");
+      say("This does not look like an Oklahoma ODOT permit. Check the State buttons.", "warn");
     }
 
     lastParse = parseOkPermitText(inspected.text);
@@ -251,12 +275,30 @@ async function runParseOk() {
       return;
     }
 
-    const coordNote =
-      lastParse.origin?.has_coords && lastParse.destination?.has_coords
-        ? "PDF coords"
-        : "will geocode start/end";
+    // SafeHaul viewer lookup by permit number (same id as in the PDF).
+    if (lastParse.permit_number) {
+      try {
+        const sh = await fetchSafehaulPermit(lastParse.permit_number);
+        lastParse.safehaul = sh;
+        if (el.txprosLink) {
+          el.txprosLink.href = sh.viewer_url || safehaulViewerUrl(lastParse.permit_number);
+          el.txprosLink.textContent = "Open in SafeHaul";
+          el.txprosLink.hidden = false;
+        }
+      } catch (_) {
+        if (el.txprosLink) {
+          el.txprosLink.href = safehaulViewerUrl(lastParse.permit_number);
+          el.txprosLink.textContent = "Open in SafeHaul";
+          el.txprosLink.hidden = false;
+        }
+      }
+    }
+
+    const stepSummary = lastParse.steps
+      .map((s) => `${s.leg_miles} ${s.road || "exit"} ${s.compass || ""}`.trim())
+      .join(" → ");
     say(
-      `Parsed OK permit ${lastParse.permit_number || ""}. ${lastParse.steps.length} steps (${coordNote}). Click Show on map.`,
+      `Parsed OK ${lastParse.permit_number || ""}. ${lastParse.steps.length} steps: ${stepSummary}. Click Show on map.`,
       "ok",
     );
   } catch (err) {
@@ -440,7 +482,7 @@ async function showOkMap() {
   syncButtons();
   try {
     ensureMap();
-    // Always rebuild so turn waypoints refresh with the latest router.
+    // Always rebuild so the line uses the latest router.
     lastOkRoute = await buildOkRoute(lastParse, MAPBOX_TOKEN, {
       onStatus: (m) => say(m),
     });
@@ -453,13 +495,11 @@ async function showOkMap() {
     fillMetaPoints(lastOkRoute.point_count);
     renderOkWarnings(lastOkRoute);
 
-    const pinCount = lastOkRoute.pins?.length || 0;
-    const turnCount = lastOkRoute.step_waypoints || Math.max(0, pinCount - 2);
     const conf = lastOkRoute.confidence || "medium";
     const kind = conf === "high" ? "ok" : conf === "medium" ? "warn" : "error";
     say(
       lastOkRoute.explanation ||
-        `Mapped Oklahoma route · ${pinCount} pins (${turnCount} turns) · ${conf} confidence.`,
+        `Mapped Oklahoma route · ${lastOkRoute.distance_mi?.toFixed?.(1) || "?"} mi · ${conf} confidence.`,
       kind,
     );
   } catch (err) {
@@ -532,14 +572,9 @@ function fillMetaPoints(n) {
           : ""),
     ],
     ["Miles", miles],
-    ["Method", lastOkRoute?.source || "permit-instructions"],
+    ["Method", lastOkRoute?.source || "start-end"],
     ["Steps", String(lastParse.steps?.length || 0)],
-    [
-      "Waypoints",
-      lastOkRoute?.pins?.length != null
-        ? `${lastOkRoute.pins.length} (start + ${lastOkRoute.step_waypoints ?? Math.max(0, lastOkRoute.pins.length - 2)} steps + end)`
-        : "—",
-    ],
+    ["Markers", "Start + End"],
     ["Points", n != null ? String(n) : "—"],
   ]);
 }
