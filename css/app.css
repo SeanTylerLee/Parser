@@ -314,6 +314,8 @@ textarea {
 }
 
 .dropzone {
+  display: block;
+  margin-bottom: 0.65rem;
   border: 1.5px dashed #9bb6e8;
   border-radius: 12px;
   padding: 1rem;
@@ -322,6 +324,11 @@ textarea {
   color: var(--muted);
   cursor: pointer;
   transition: 0.15s ease;
+}
+
+.dropzone span {
+  display: block;
+  margin-top: 0.2rem;
 }
 
 .dropzone.drag,

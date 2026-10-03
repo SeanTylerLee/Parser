@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <meta name="theme-color" content="#001848" />
-  <title>Permit Parser — FleetBord</title>
+  <title>FleetBord — Oklahoma permits</title>
   <meta name="robots" content="noindex, nofollow" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -12,14 +12,12 @@
   <link href="https://api.mapbox.com/mapbox-gl-js/v3.14.0/mapbox-gl.css" rel="stylesheet" />
   <link rel="stylesheet" href="css/app.css" />
   <script src="https://api.mapbox.com/mapbox-gl-js/v3.14.0/mapbox-gl.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
 </head>
 <body>
   <header class="topbar">
     <div class="brand">
-      <strong id="brandTitle">Permit Parser</strong>
-      <span>FleetBord · <span id="parserVersion">…</span></span>
+      <strong>FleetBord</strong>
+      <span>Oklahoma permits · <span id="parserVersion">…</span></span>
     </div>
     <div class="topbar-actions">
       <button type="button" class="btn btn-ghost" id="satBtn">Satellite</button>
@@ -28,52 +26,22 @@
 
   <div class="layout">
     <aside class="sidebar">
-      <p id="status" class="status" data-kind="info">1) Upload a permit · 2) Parse · 3) Show on map</p>
+      <p id="status" class="status" data-kind="info">Upload an Oklahoma permit PDF. The driving directions are read and drawn on the map.</p>
 
       <section class="panel">
-        <h2>Steps</h2>
-
-        <div class="state-field" role="group" aria-label="State">
-          <span class="state-label">State</span>
-          <div class="state-toggle">
-            <button type="button" class="btn state-btn is-active" id="txStateBtn" data-state="TX" aria-pressed="true">Texas</button>
-            <button type="button" class="btn state-btn" id="okStateBtn" data-state="OK" aria-pressed="false">Oklahoma</button>
-          </div>
-        </div>
-
-        <div class="actions">
-          <button type="button" class="btn btn-dark btn-block" id="uploadBtn">1. Upload</button>
-          <input id="fileInput" type="file" accept="image/jpeg,image/png,image/webp,application/pdf,.pdf" hidden />
-
-          <p id="fileLabel" class="file-label">No file selected</p>
-
-          <button type="button" class="btn btn-primary btn-block" id="parseBtn" disabled>2. Parse</button>
-          <button type="button" class="btn btn-primary btn-block" id="routeBtn" disabled>3. Show on map</button>
-        </div>
-
-        <div class="preview" id="preview" hidden>
-          <img id="previewImg" alt="Permit preview" />
-        </div>
-
-        <details class="raw-text" id="txFallback">
-          <summary>Manual Permit ID (fallback)</summary>
-          <label class="field">TxPROS Permit ID or link
-            <input id="permitId" type="text" autocomplete="off" spellcheck="false"
-              placeholder="Only if QR/PDF ID wasn’t found" />
-          </label>
-          <a id="txprosLink" class="note" href="#" target="_blank" rel="noopener" hidden>Open in TxPROS</a>
-        </details>
+        <h2>Permit</h2>
+        <label class="dropzone" id="dropzone">
+          <strong>Upload Oklahoma permit PDF</strong>
+          <span>Miles and road names from the driving directions</span>
+          <input id="fileInput" type="file" accept="application/pdf,.pdf" />
+        </label>
+        <p id="fileLabel" class="file-label">No file selected</p>
       </section>
 
       <section class="panel" id="resultPanel" hidden>
-        <h2>Route</h2>
+        <h2>Driving directions</h2>
         <dl class="meta" id="meta"></dl>
         <ul class="list compact" id="steps"></ul>
-        <details class="raw-text">
-          <summary>Edit extracted text</summary>
-          <textarea id="permitText"></textarea>
-          <button type="button" class="btn" id="reparseBtn">Re-parse text</button>
-        </details>
       </section>
     </aside>
 
@@ -82,6 +50,6 @@
     </main>
   </div>
 
-  <script type="module" src="js/app.js?v=ok38-concurrent"></script>
+  <script type="module" src="js/app.js?v=odometer"></script>
 </body>
 </html>

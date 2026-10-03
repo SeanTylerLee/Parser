@@ -7,7 +7,7 @@
  * - "(Outbound)" suffixes, multi-page direction tables
  */
 
-export const OK_PARSER_VERSION = "ok-directions-v5";
+export const OK_PARSER_VERSION = "oklahoma-directions";
 
 const PERMIT_NO_RE = /Permit\s*Number:\s*(\d{10,})/i;
 const APPROX_MI_RE = /Approximate\s*Mileage:\s*([\d.]+)\s*mi/i;
@@ -202,6 +202,15 @@ function annotateStep(leg_miles, instruction) {
   if (!compass) {
     const lead = instruction.match(/\b(?:Continue|Turn|Bear)\s+(NORTH|SOUTH|EAST|WEST)\b/i);
     if (lead) compass = lead[1].toUpperCase();
+  }
+  // "Byp S" is a travel direction. "Rd E" / "St W" is part of the street name.
+  if (!compass) {
+    const tail = instruction.match(/\s([NSEW])\s*$/);
+    const streetSuffix =
+      /\b(?:RD|ST|AVE|DR|LN|BLVD|HWY|ROAD|STREET|AVENUE|DRIVE|LANE|CT|CIR|PL|PKWY)\s+[NSEW]\s*$/i.test(
+        instruction,
+      );
+    if (tail && !streetSuffix) compass = tail[1].toUpperCase();
   }
   if (compass === "N" || compass === "NORTH") compass = "NB";
   if (compass === "S" || compass === "SOUTH") compass = "SB";

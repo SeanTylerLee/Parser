@@ -1,7 +1,6 @@
-import { TEXAS_CENTER, OKLAHOMA_CENTER } from "./geocode.js";
-
 const STYLE_STREETS = "mapbox://styles/mapbox/streets-v12";
 const STYLE_SAT = "mapbox://styles/mapbox/satellite-streets-v12";
+const OKLAHOMA_CENTER = [-97.5, 35.5];
 
 let map = null;
 let markers = [];
@@ -11,7 +10,7 @@ export function hasMap() {
   return Boolean(map);
 }
 
-export function initMap(token, containerId = "map", { state = "TX" } = {}) {
+export function initMap(token, containerId = "map") {
   if (!window.mapboxgl) throw new Error("Mapbox GL failed to load.");
   mapboxgl.accessToken = token;
 
@@ -24,27 +23,13 @@ export function initMap(token, containerId = "map", { state = "TX" } = {}) {
   map = new mapboxgl.Map({
     container: containerId,
     style: STYLE_STREETS,
-    center: stateCenter(state),
-    zoom: state === "OK" ? 6.2 : 5.2,
+    center: OKLAHOMA_CENTER,
+    zoom: 6.2,
     attributionControl: true,
   });
   map.addControl(new mapboxgl.NavigationControl({ showCompass: false }), "top-right");
   map.addControl(new mapboxgl.ScaleControl({ unit: "imperial" }));
   return map;
-}
-
-export function setMapState(state) {
-  if (!map) return;
-  clearMapOverlays();
-  map.easeTo({
-    center: stateCenter(state),
-    zoom: state === "OK" ? 6.2 : 5.2,
-    duration: 500,
-  });
-}
-
-function stateCenter(state) {
-  return state === "OK" ? OKLAHOMA_CENTER : TEXAS_CENTER;
 }
 
 export function setSatellite(on) {
@@ -71,51 +56,57 @@ export function clearMapOverlays() {
   if (map.getSource("permit-route")) map.removeSource("permit-route");
 }
 
-export function drawPins(pins) {
+export function drawPermitRoute(route, { originLabel = "Start", destLabel = "End" } = {}) {
+  if (!map || !route?.coordinates?.length) return;
+  clearMapOverlays();
+  const coords = route.coordinates;
+  drawPins([
+    {
+      label: "Start",
+      displayText: originLabel,
+      lng: coords[0][0],
+      lat: coords[0][1],
+    },
+    {
+      label: "End",
+      displayText: destLabel,
+      lng: coords[coords.length - 1][0],
+      lat: coords[coords.length - 1][1],
+    },
+  ]);
+  drawRouteGeoJSON({
+    type: "Feature",
+    properties: { source: route.source || "permit-directions", point_count: coords.length },
+    geometry: { type: "LineString", coordinates: coords },
+  });
+}
+
+function drawPins(pins) {
   if (!map) return;
-  markers.forEach((m) => m.remove());
-  markers = [];
-
   const bounds = new mapboxgl.LngLatBounds();
-  let any = false;
-
   pins.forEach((pin, i) => {
     if (pin.lng == null || pin.lat == null) return;
-    any = true;
     bounds.extend([pin.lng, pin.lat]);
     const el = document.createElement("div");
-    const kind =
-      i === 0
-        ? "origin"
-        : i === pins.length - 1
-          ? "destination"
-          : "turn";
-    el.className = `pin pin-${kind}${pin.weak ? " pin-weak" : ""}`;
-    el.textContent = String(i + 1);
-    el.title = pin.displayText || pin.text;
+    el.className = `pin ${i === 0 ? "pin-origin" : "pin-destination"}`;
+    el.textContent = i === 0 ? "A" : "B";
+    el.title = pin.displayText || pin.label;
     const marker = new mapboxgl.Marker({ element: el, anchor: "bottom" })
       .setLngLat([pin.lng, pin.lat])
       .setPopup(
         new mapboxgl.Popup({ offset: 18 }).setHTML(
-          `<strong>${escapeHtml(pin.label)}</strong><br>${escapeHtml(pin.displayText || pin.text)}` +
-            (pin.place ? `<br><span class="muted">${escapeHtml(pin.place)}</span>` : "") +
-            `<br><span class="muted">score ${Math.round(pin.score)}</span>`,
+          `<strong>${escapeHtml(pin.label)}</strong><br>${escapeHtml(pin.displayText || "")}`,
         ),
       )
       .addTo(map);
     markers.push(marker);
   });
-
-  if (any) {
-    if (pins.filter((p) => p.lng != null).length === 1) {
-      map.easeTo({ center: bounds.getCenter(), zoom: 11 });
-    } else {
-      map.fitBounds(bounds, { padding: 56, maxZoom: 12, duration: 600 });
-    }
+  if (!bounds.isEmpty()) {
+    map.fitBounds(bounds, { padding: 56, maxZoom: 12, duration: 600 });
   }
 }
 
-export function drawRouteGeoJSON(feature) {
+function drawRouteGeoJSON(feature) {
   if (!map || !feature?.geometry) return;
   const apply = () => {
     if (map.getSource("permit-route")) {
@@ -141,7 +132,6 @@ export function drawRouteGeoJSON(feature) {
     const coords = feature.geometry.coordinates || [];
     if (coords.length >= 2) {
       const bounds = new mapboxgl.LngLatBounds();
-      // Sample for fitBounds speed on long TxPROS polylines.
       const step = Math.max(1, Math.floor(coords.length / 200));
       for (let i = 0; i < coords.length; i += step) bounds.extend(coords[i]);
       bounds.extend(coords[coords.length - 1]);
@@ -150,74 +140,7 @@ export function drawRouteGeoJSON(feature) {
   };
 
   if (map.isStyleLoaded()) apply();
-  else {
-    map.once("load", apply);
-    map.once("style.load", apply);
-  }
-}
-
-/** Draw permit geometry: full polyline + start/end pins (optional custom pin list). */
-export function drawPermitRoute(route, { originLabel = "Origin", destLabel = "Destination", pins } = {}) {
-  if (!map || !route?.coordinates?.length) return;
-  clearMapOverlays();
-  const coords = route.coordinates;
-  const endPins =
-    pins?.length >= 2
-      ? pins.filter((p) => p.lng != null && p.lat != null)
-      : [
-          {
-            label: originLabel,
-            displayText: originLabel,
-            text: "Start",
-            lng: coords[0][0],
-            lat: coords[0][1],
-            place: null,
-            score: 100,
-            weak: false,
-            ok: true,
-          },
-          {
-            label: destLabel,
-            displayText: destLabel,
-            text: "End",
-            lng: coords[coords.length - 1][0],
-            lat: coords[coords.length - 1][1],
-            place: null,
-            score: 100,
-            weak: false,
-            ok: true,
-          },
-        ];
-  // Show start, end, and intermediate step/turn waypoints when present.
-  const showPins =
-    endPins.length <= 2
-      ? endPins
-      : endPins.map((p, i, arr) => {
-          if (i === 0) return { ...p, label: p.label || "Origin" };
-          if (i === arr.length - 1) return { ...p, label: p.label || "Destination" };
-          return {
-            ...p,
-            label: p.label || "Turn",
-            // Smaller visual weight via existing turn style
-          };
-        });
-  drawPins(showPins);
-  drawRouteGeoJSON({
-    type: "Feature",
-    properties: {
-      source: route.source || "permit",
-      point_count: coords.length,
-    },
-    geometry: { type: "LineString", coordinates: coords },
-  });
-}
-
-/** @deprecated use drawPermitRoute */
-export function drawTxprosRoute(route) {
-  return drawPermitRoute(route, {
-    originLabel: "TxPROS start",
-    destLabel: "TxPROS end",
-  });
+  else map.once("load", apply);
 }
 
 function escapeHtml(s) {

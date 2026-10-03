@@ -6,7 +6,13 @@
  * miles and the road name miss. Mapbox is only used for a short exit hop.
  */
 
-import { OKLAHOMA_BBOX, OKLAHOMA_CENTER } from "./geocode.js";
+const OKLAHOMA_BBOX = [-103.002455, 33.615833, -94.430662, 37.002312];
+const OKLAHOMA_CENTER = [-97.5, 35.5];
+
+const OK_LRS_QUERY =
+  "https://services6.arcgis.com/RBtoEUQ2lmN0K3GY/arcgis/rest/services/OKRoads_LRS/FeatureServer/0/query";
+const OK_LOCAL_QUERY =
+  "https://services6.arcgis.com/RBtoEUQ2lmN0K3GY/arcgis/rest/services/Local_Roadways/FeatureServer/0/query";
 
 const METERS_PER_MILE = 1609.344;
 const THIN_MILES = 0.02;
@@ -80,8 +86,6 @@ export async function buildOkRoute(parsed, token, { onStatus, baseUrl = "" } = {
     lrs = await fetchOkLrs(codes, bbox, baseUrl);
   }
 
-  const learned = learnHighwayAliases(parsed.steps);
-
   say("Following permit directions step by step…");
   let pos = origin;
   const coordinates = [[pos.lng, pos.lat]];
@@ -99,9 +103,6 @@ export async function buildOkRoute(parsed, token, { onStatus, baseUrl = "" } = {
     const markAt = coordinates.length;
 
     const prevRoadCode = lastRoad ? toOdotRoute(lastRoad) : null;
-    if (step.road) lastRoad = step.road;
-    if (step.compass) lastCompass = step.compass;
-
     const road = step.road || (isExit ? null : lastRoad);
     const compass = step.compass || lastCompass;
     const label = names[0] || road || "exit";
@@ -117,187 +118,37 @@ export async function buildOkRoute(parsed, token, { onStatus, baseUrl = "" } = {
     let roadOk = names.length ? false : null;
     let measured = null;
 
-    const prevStep = i > 0 ? parsed.steps[i - 1] : null;
-    const prevConnector = prevStep && /^(Take exit|Merge)|\(Ramp\)/i.test(String(prevStep.instruction || "").trim() + (prevStep.maneuver || ""));
-    // Stay snapped to the same numbered highway across LRS gaps.
-    const maxSnap = i === 0 ? 2.5 : prevConnector ? 2.0 : sameHwy ? 2.5 : /Continue/i.test(step.maneuver || "") ? 1.5 : 1.2;
-    let highway = pickHighway(names, lrs, pos, maxSnap, continueCode);
-    if (!highway && thisCode && lrs.routes?.[thisCode]?.length) {
-      const snap = nearestDistMiles(lrs.routes[thisCode], pos);
-      if (snap <= Math.max(maxSnap, 3)) {
-        highway = { code: thisCode, name: names.find((n) => toOdotRoute(n) === thisCode) || thisCode, lines: lrs.routes[thisCode], snap };
-      }
-    }
-    if (highway && !isExit) {
-      const walkOpts = { maxSnapMi: maxSnap, joinMi: sameHwy ? 4 : 2.5 };
-      let walked = walkHighway(highway.lines, pos, compass, miles, dest, walkOpts);
-      if (walked?.coords?.length && compass && !directionOk(pos, walked.coords[walked.coords.length - 1], compass)) {
-        const forced = walkHighway(highway.lines, pos, compass, miles, dest, { ...walkOpts, strict: true });
-        if (forced?.coords?.length) walked = forced;
-      }
-      let got = walked ? pathMiles(walked.coords.map((p) => (Array.isArray(p) ? p : [p.lng, p.lat]))) : 0;
-      let usedHwy = highway;
-      // Concurrent aliases: if OK-152 fails, walk US-81 when the permit lists it.
-      if (got < Math.max(0.05, miles * 0.5)) {
-        for (const name of names) {
-          const code = toOdotRoute(name);
-          if (!code || code === usedHwy.code) continue;
-          const lines = lrs.routes?.[code] || [];
-          if (!lines.length) continue;
-          const alt = walkHighway(lines, pos, compass, miles, dest, {
-            maxSnapMi: Math.max(maxSnap, 3),
-            joinMi: 4,
-          });
-          const altMi = alt ? pathMiles(alt.coords.map((p) => (Array.isArray(p) ? p : [p.lng, p.lat]))) : 0;
-          if (altMi > got) {
-            walked = alt;
-            got = altMi;
-            usedHwy = { code, name, lines, snap: nearestDistMiles(lines, pos) };
-          }
-        }
-      }
-      if (walked?.coords?.length && got >= 0.05) {
-        appendCoords(coordinates, walked.coords.map((p) => (Array.isArray(p) ? p : [p.lng, p.lat])));
-        pos = walked.end;
-        usedRoad = usedHwy.name;
-        roadOk = true;
-        measured = got;
-        if (toOdotRoute(usedHwy.name) || usedHwy.code) lastRoad = usedHwy.name;
-      } else {
-        usedRoad = null;
-        roadOk = false;
-        measured = 0;
-      }
-    } else if (!isExit && names.length) {
-      const desired = desiredBearing(heading, step.maneuver, compass);
-      const nextForDir = parsed.steps.slice(i + 1).find((s) => stepNames(s).length);
-      const nextForLines = nextForDir ? pickHighway(stepNames(nextForDir), lrs, pos, Math.max(3, miles + 1)) : null;
-      // One lookup only covers a few miles. Keep walking the same named road
-      // until the mileage column is used or the centerline stops.
-      let remaining = miles;
-      let snapMiles = null;
-      let walkedName = null;
-      for (let hop = 0; hop < 8 && remaining > 0.05; hop++) {
-        let ways = [];
-        try {
-          const pack = await fetchOkStreetsNear(pos, Math.min(remaining, 2.5), names, baseUrl);
-          ways = (pack.ways || []).filter((w) => names.some((n) => streetNamesMatch(n, w.name) || streetNamesMatch(n, w.matched)));
-          if (pack.warning && !ways.length && hop === 0) warnings.push(`Step ${i + 1}: ${pack.warning}`);
-        } catch (_) {
-          ways = [];
-        }
-        const walked = walkNamedWays(ways, pos, remaining, desired, dest, nextForLines?.lines || null);
-        const gained = walked?.walkedMiles || 0;
-        if (!walked?.coords?.length || gained < 0.02) break;
-        appendCoords(coordinates, walked.coords.map((p) => [p.lng, p.lat]));
-        pos = walked.end;
-        walkedName = walked.name;
-        if (snapMiles == null) snapMiles = walked.snapMiles;
-        remaining -= gained;
-      }
-      if (walkedName) {
-        usedRoad = walkedName;
-        roadOk = snapMiles <= 0.8;
-        measured = Math.max(0, miles - remaining);
-      } else {
-        const alias = names.map((n) => learned.get(compactRoad(n))).find(Boolean);
-        const aliasLines = alias ? lrs.routes?.[alias.code] || [] : [];
-        const hw = aliasLines.length
-          ? walkHighway(aliasLines, pos, compass, miles, dest, { maxSnapMi: maxSnap })
-          : null;
-        if (hw?.coords?.length) {
-          appendCoords(coordinates, hw.coords.map((p) => (Array.isArray(p) ? p : [p.lng, p.lat])));
-          pos = hw.end;
-          usedRoad = alias.name;
-          roadOk = true;
-          measured = pathMiles(hw.coords.map((p) => (Array.isArray(p) ? p : [p.lng, p.lat])));
-        } else {
-          // Permit name may not match the map. On a turn, walk whatever
-          // centerline is at this junction in the stated direction.
-          const turn = /Turn|Bear|Start on|Continue/i.test(step.maneuver || instr);
-          const anyHwy = turn ? walkNearestHighway(lrs, pos, compass, miles, dest, Math.max(maxSnap, 1.2)) : null;
-          if (anyHwy?.coords?.length) {
-            appendCoords(coordinates, anyHwy.coords.map((p) => (Array.isArray(p) ? p : [p.lng, p.lat])));
-            pos = anyHwy.end;
-            usedRoad = anyHwy.name;
-            roadOk = true;
-            measured = pathMiles(anyHwy.coords.map((p) => (Array.isArray(p) ? p : [p.lng, p.lat])));
-          } else {
-            // Short hop toward the next numbered highway (exit-style).
-            const nextHwy = parsed.steps.slice(i + 1).find((s) => stepNames(s).some((n) => toOdotRoute(n)));
-            const hwyNames = nextHwy ? stepNames(nextHwy).filter((n) => toOdotRoute(n)) : [];
-            const reach = Math.max(3, miles * 3);
-            const nh = hwyNames.length ? pickHighway(hwyNames, lrs, pos, reach) : null;
-            const target = nh ? nearestOnLines(nh.lines, pos) : null;
-            const gap = target ? haversineMiles(pos, target) : Infinity;
-            if (target && gap <= reach) {
-              const go = Math.min(Math.max(miles, 0.05), gap);
-              const mid = moveByHeading(pos, bearingDeg(pos, target), go);
-              if (mid) {
-                coordinates.push([mid.lng, mid.lat]);
-                pos = mid;
-                usedRoad = nh.name || names[0];
-                roadOk = true;
-                measured = go;
-              } else {
-                usedRoad = null;
-                roadOk = false;
-                measured = 0;
-              }
-            } else {
-              usedRoad = null;
-              roadOk = false;
-              measured = 0;
-            }
-          }
-        }
-      }
+    const leg = legCourse(step, heading, parsed.steps[i + 1]);
+    const travel = leg.compass;
+    // An exit has no road name. It runs toward the direction of the next line.
+    const nextLeg = isExit ? legCourse(parsed.steps[i + 1] || {}, leg.bearing, null) : null;
+    const legHeading = isExit && nextLeg?.bearing != null ? nextLeg.bearing : leg.bearing;
+
+    const driven = await driveLeg({
+      pos,
+      miles,
+      heading: legHeading,
+      names: isExit ? [] : names,
+      lrs,
+      preferNamed: !isExit && names.length > 0,
+    });
+    if (driven.coords.length) {
+      appendCoords(coordinates, driven.coords);
+      pos = driven.end;
+      usedRoad = driven.roadName || names[0] || null;
+      roadOk = names.length ? Boolean(driven.roadName) : null;
+      measured = driven.walkedMiles;
+      if (driven.roadName) lastRoad = names[0] || driven.roadName;
+      if (travel) lastCompass = travel;
     } else {
-      // Exit, ramp, or a step with no road name: short hop toward the next named road.
-      const next = parsed.steps.slice(i + 1).find((s) => stepNames(s).length);
-      const nextNames = next ? stepNames(next) : [];
-      const reach = Math.max(3, miles * 3);
-      const nextHighway = next ? pickHighway(nextNames, lrs, pos, reach) : null;
-      let target = nextHighway ? nearestOnLines(nextHighway.lines, pos) : null;
-      if (!target && nextNames.length) {
-        try {
-          const pack = await fetchOkStreetsNear(pos, Math.max(miles, 1), nextNames, baseUrl);
-          const ways = (pack.ways || []).filter((w) =>
-            nextNames.some((n) => streetNamesMatch(n, w.name) || streetNamesMatch(n, w.matched)),
-          );
-          target = nearestNamedPoint(ways, pos);
-        } catch (_) {
-          target = null;
-        }
-      }
-      const gap = target ? haversineMiles(pos, target) : Infinity;
-      if (target && gap <= reach) {
-        if (gap > 0.04) {
-          coordinates.push([target.lng, target.lat]);
-          pos = target;
-        }
-        // A short ramp whose highways already meet has no separate centerline.
-        measured = !names.length && miles <= 0.5 && gap <= 0.25 ? miles : gap;
-        if (names.length) {
-          usedRoad = nextHighway?.name || null;
-          roadOk = true;
-        } else {
-          roadOk = null;
-        }
-      } else {
-        measured = 0;
-        roadOk = names.length ? false : null;
-      }
+      measured = 0;
+      roadOk = names.length ? false : null;
     }
 
     const added = coordinates.slice(Math.max(0, markAt - 1));
     const walkedMi = measured != null ? measured : pathMiles(added);
     const milesOk = milesClose(miles, walkedMi);
-    // Map label vs permit name does not fail the step. Miles + a drawn
-    // centerline (or a turn onto the road that is there) is enough.
-    if (walkedMi >= 0.02 && roadOk === false) roadOk = true;
-    if (milesOk && usedRoad && roadOk === false) roadOk = true;
-    const bothFail = milesOk === false && walkedMi < 0.02;
+    const bothFail = Boolean(names.length) && milesOk === false && walkedMi < 0.02;
     if (bothFail) roadOk = false;
     stepChecks.push({
       index: i,
@@ -321,16 +172,7 @@ export async function buildOkRoute(parsed, token, { onStatus, baseUrl = "" } = {
       );
     }
 
-    if (coordinates.length >= 2) {
-      const a = coordinates[coordinates.length - 2];
-      const b = coordinates[coordinates.length - 1];
-      if (haversineMiles(a, b) > 0.02) heading = bearingDeg(a, b);
-    }
-  }
-
-  // The directions already ended. Only close a short gap to the permit pin.
-  if (haversineMiles(pos, dest) <= 0.75) {
-    coordinates.push([dest.lng, dest.lat]);
+    if (leg.bearing != null) heading = ((leg.bearing % 360) + 360) % 360;
   }
 
   const thin = thinCoords(coordinates, THIN_MILES);
@@ -493,6 +335,36 @@ function compactRoad(name) {
   return s.replace(/\s+/g, " ").trim();
 }
 
+function directionToken(name) {
+  const s = ` ${String(name || "")
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, " ")
+    .trim()} `;
+  const m = s.match(/ (NORTHWEST|NORTHEAST|SOUTHWEST|SOUTHEAST|NORTH|SOUTH|EAST|WEST|NW|NE|SW|SE|N|S|E|W) /);
+  if (!m) return "";
+  return (
+    {
+      NORTH: "N",
+      SOUTH: "S",
+      EAST: "E",
+      WEST: "W",
+      NORTHWEST: "NW",
+      NORTHEAST: "NE",
+      SOUTHWEST: "SW",
+      SOUTHEAST: "SE",
+    }[m[1]] || m[1]
+  );
+}
+
+/** "S Red Rock" is not "North Red Rock". A direction word in the permit name has to agree. */
+function nameDirectionConflicts(permitNames, street) {
+  // Only the road named after "onto", not a grid alias like "N 2730 Rd".
+  const want = directionToken(permitNames?.[0]);
+  const got = directionToken(street);
+  if (!want || !got) return false;
+  return want !== got;
+}
+
 function streetNamesMatch(a, b) {
   const ca = compactRoad(a).replace(/\s+/g, "");
   const cb = compactRoad(b).replace(/\s+/g, "");
@@ -536,6 +408,46 @@ function bearingDeg(a, b) {
 function angleDiff(a, b) {
   const d = Math.abs(a - b) % 360;
   return d > 180 ? 360 - d : d;
+}
+
+/** Miles and the turn in this direction decide the way to drive. */
+function legCourse(step, incoming, nextStep) {
+  if (step?.compass) {
+    return { compass: step.compass, bearing: desiredBearing(null, null, step.compass) };
+  }
+  const man = `${step?.maneuver || ""} ${step?.instruction || ""}`;
+  if (incoming != null) {
+    let bearing = incoming;
+    if (/Turn LEFT/i.test(man)) bearing = incoming - 90;
+    else if (/Turn RIGHT/i.test(man)) bearing = incoming + 90;
+    else if (/Bear LEFT/i.test(man)) bearing = incoming - 40;
+    else if (/Bear RIGHT/i.test(man)) bearing = incoming + 40;
+    return { compass: compassFromBearing(bearing), bearing };
+  }
+  const inferred = compassFromNextTurn(nextStep);
+  if (inferred) return { compass: inferred, bearing: desiredBearing(null, null, inferred) };
+  return { compass: null, bearing: null };
+}
+
+function compassFromBearing(bearing) {
+  if (bearing == null || Number.isNaN(bearing)) return null;
+  const n = ((bearing % 360) + 360) % 360;
+  if (n >= 315 || n < 45) return "NB";
+  if (n < 135) return "EB";
+  if (n < 225) return "SB";
+  return "WB";
+}
+
+/** The road we are on now, read from the next turn. Right onto SB means we are heading east. */
+function compassFromNextTurn(nextStep) {
+  if (!nextStep?.compass) return null;
+  const after = { NB: 0, EB: 90, SB: 180, WB: 270 }[nextStep.compass];
+  if (after == null) return null;
+  const man = String(nextStep.maneuver || "");
+  if (/Turn LEFT|Bear LEFT/i.test(man)) return compassFromBearing(after + 90);
+  if (/Turn RIGHT|Bear RIGHT/i.test(man)) return compassFromBearing(after - 90);
+  if (/Continue/i.test(man)) return nextStep.compass;
+  return null;
 }
 
 function desiredBearing(incoming, maneuver, compass) {
@@ -618,32 +530,35 @@ function nearestNamedPoint(ways, from) {
   return best ? xy(best.p) : null;
 }
 
-function walkNamedWays(ways, from, miles, desired, dest, nextLines) {
+function walkNamedWays(ways, from, miles, desired, dest, nextLines, maxSnapMi = 2.2) {
   if (!ways?.length) return null;
-  let best = null;
+  const starts = [];
   for (const way of ways) {
-    const coords = way.coords || [];
-    for (let i = 0; i < coords.length; i++) {
-      const d = haversineMiles(from, coords[i]);
-      if (!best || d < best.d) best = { way, i, d };
+    let nearest = null;
+    for (let i = 0; i < (way.coords || []).length; i++) {
+      const d = haversineMiles(from, way.coords[i]);
+      if (!nearest || d < nearest.d) nearest = { way, i, d };
     }
+    if (nearest && nearest.d <= maxSnapMi) starts.push(nearest);
   }
-  if (!best || best.d > 0.8) return null;
+  starts.sort((a, b) => a.d - b.d);
+  if (!starts.length) return null;
 
   const target = Math.max(miles, 0.05) * METERS_PER_MILE;
+  let start = starts[0];
   function trace(startDir) {
-    let current = best.way.coords;
-    let i = best.i;
+    let current = start.way.coords;
+    let i = start.i;
     let dir = startDir;
     const out = [xy(current[i])];
     let traveled = 0;
-    const used = new Set([best.way]);
+    const used = new Set([start.way]);
     while (traveled < target) {
       const next = i + dir;
       if (next >= 0 && next < current.length) {
         const seg = haversineMeters(current[i], current[next]);
         // Stay on the permit compass. Same-name pieces often loop; skip reverse edges.
-        if (desired != null && seg > 8 && angleDiff(bearingDeg(current[i], current[next]), desired) > 70) {
+        if (desired != null && seg > 8 && angleDiff(bearingDeg(current[i], current[next]), desired) > 120) {
           // Fall through to a forward join instead of walking backward.
         } else {
           if (traveled + seg >= target && seg > 0) {
@@ -664,19 +579,31 @@ function walkNamedWays(ways, from, miles, desired, dest, nextLines) {
       let jump = null;
       for (const other of ways) {
         if (used.has(other)) continue;
-        if (!streetNamesMatch(other.name, best.way.name) && !streetNamesMatch(other.matched, best.way.matched)) continue;
+        if (!streetNamesMatch(other.name, start.way.name) && !streetNamesMatch(other.matched, start.way.matched)) continue;
         for (const end of [0, other.coords.length - 1]) {
           const p = other.coords[end];
           const d = haversineMeters(tip, p);
-          if (d > 0.5 * METERS_PER_MILE) continue;
+          if (d > 1.5 * METERS_PER_MILE) continue;
           const far = end === 0 ? other.coords[other.coords.length - 1] : other.coords[0];
           // Same-name pieces include cross streets. Only continue in the permit direction.
-          if (desired != null && (!far || angleDiff(bearingDeg(tip, far), desired) > 55)) continue;
-          if (desired != null && d > 20 && angleDiff(bearingDeg(tip, p), desired) > 70) continue;
+          if (desired != null && (!far || angleDiff(bearingDeg(tip, far), desired) > 110)) continue;
+          if (desired != null && d > 20 && angleDiff(bearingDeg(tip, p), desired) > 110) continue;
           if (!jump || d < jump.d) jump = { other, end, d };
         }
       }
       if (!jump) break;
+      const remain = target - traveled;
+      if (jump.d >= remain) {
+        const t = remain / jump.d;
+        const tipPt = xy(tip);
+        const destPt = xy(jump.other.coords[jump.end]);
+        out.push({
+          lng: tipPt.lng + (destPt.lng - tipPt.lng) * t,
+          lat: tipPt.lat + (destPt.lat - tipPt.lat) * t,
+        });
+        traveled = target;
+        break;
+      }
       used.add(jump.other);
       current = jump.end === 0 ? jump.other.coords : jump.other.coords.slice().reverse();
       traveled += jump.d;
@@ -691,57 +618,425 @@ function walkNamedWays(ways, from, miles, desired, dest, nextLines) {
     };
   }
 
-  let dir = 1;
-  if (desired != null) {
-    let score = Infinity;
-    const line = best.way.coords;
-    for (const d of [1, -1]) {
-      const j = best.i + d;
-      if (j < 0 || j >= line.length) continue;
-      const diff = angleDiff(bearingDeg(line[best.i], line[j]), desired);
-      if (diff < score) {
-        score = diff;
-        dir = d;
+  let winner = null;
+  for (const candidate of starts.slice(0, 24)) {
+    start = candidate;
+    let dir = 1;
+    if (desired != null) {
+      let score = Infinity;
+      const line = start.way.coords;
+      for (const d of [1, -1]) {
+        const j = start.i + d;
+        if (j < 0 || j >= line.length) continue;
+        const diff = angleDiff(bearingDeg(line[start.i], line[j]), desired);
+        if (diff < score) {
+          score = diff;
+          dir = d;
+        }
+      }
+    } else if (dest) {
+      dir = pickCompassDirection(start.way.coords, start.i, null, dest);
+    }
+    const traced = trace(dir);
+    if (!traced.coords || traced.coords.length < 2 || traced.walkedMiles < 0.02) continue;
+    if (!winner || traced.walkedMiles > winner.walkedMiles) {
+      winner = {
+        coords: traced.coords,
+        end: traced.end,
+        snapMiles: candidate.d,
+        walkedMiles: traced.walkedMiles,
+        name: candidate.way.name,
+      };
+    }
+    if (winner.walkedMiles >= Math.max(miles, 0.05) * 0.85) break;
+  }
+  return winner;
+}
+
+function localNeedles(names) {
+  const skip = new Set([
+    "NORTH", "SOUTH", "EAST", "WEST", "NORTHWEST", "NORTHEAST", "SOUTHWEST", "SOUTHEAST",
+    "ROAD", "STREET", "AVENUE", "DRIVE", "LANE", "BOULEVARD", "HIGHWAY", "HWY",
+    "RD", "ST", "AVE", "DR", "LN", "BLVD",
+  ]);
+  const needles = [];
+  const add = (token) => {
+    const t = String(token || "").toUpperCase();
+    if (t && !needles.includes(t)) needles.push(t);
+  };
+  for (const name of names) {
+    let raw = String(name || "")
+      .replace(/[^A-Za-z0-9]+/g, " ")
+      .toUpperCase()
+      .trim();
+    raw = raw.replace(/\b(ROAD|STREET|AVENUE|DRIVE|LANE|BOULEVARD|HIGHWAY|HWY|RD|ST|AVE|DR|LN|BLVD)\b/g, " ");
+    raw = raw.replace(/\s+/g, " ").trim();
+    const spaced = raw.replace(/([A-Z])(\d)/g, "$1 $2");
+    const grid = spaced.match(/\b([NSEW])\s+0*(\d+)\b/);
+    if (grid) add(grid[1] + grid[2]);
+    const words = spaced.split(" ").filter((w) => w.length >= 4 && !skip.has(w));
+    const short = spaced.split(" ").filter((w) => w.length === 3 && !skip.has(w));
+    for (const word of words.length ? words : short) add(word);
+  }
+  return needles.slice(0, 8);
+}
+
+async function fetchOkStreetsNear(pos, miles, names) {
+  const needles = localNeedles(names);
+  if (!needles.length) return { ok: true, ways: [] };
+  const radius = Math.min(20000, Math.max(6000, (Number(miles) || 1) * 1609 * 2));
+  const dlat = radius / 111320;
+  const dlng = radius / (111320 * Math.max(0.2, Math.cos((pos.lat * Math.PI) / 180)));
+  const west = pos.lng - dlng;
+  const south = pos.lat - dlat;
+  const east = pos.lng + dlng;
+  const north = pos.lat + dlat;
+  const likes = needles.map((n) => `UPPER(STREETNAME) LIKE '%${n.replace(/'/g, "")}%'`).join(" OR ");
+  const params = new URLSearchParams({
+    where: likes,
+    geometry: `${west},${south},${east},${north}`,
+    geometryType: "esriGeometryEnvelope",
+    inSR: "4326",
+    spatialRel: "esriSpatialRelIntersects",
+    outFields: "STREETNAME,MLENGTH",
+    returnGeometry: "true",
+    outSR: "4326",
+    f: "geojson",
+    resultRecordCount: "2000",
+  });
+  try {
+    const res = await fetch(`${OK_LOCAL_QUERY}?${params}`);
+    const gj = await res.json().catch(() => ({}));
+    if (!res.ok || gj.error) return { ok: true, ways: [], warning: "Local roads unavailable" };
+    const ways = [];
+    for (const feat of gj.features || []) {
+      const street = feat.properties?.STREETNAME || "";
+      const matched = names.find((n) => streetNamesMatch(n, street));
+      if (!matched) continue;
+      const geom = feat.geometry || {};
+      const parts =
+        geom.type === "LineString" ? [geom.coordinates] : geom.type === "MultiLineString" ? geom.coordinates : [];
+      for (const part of parts) {
+        const cleaned = (part || [])
+          .filter((p) => p && p.length >= 2)
+          .map((p) => [Number(p[0]), Number(p[1])]);
+        if (cleaned.length >= 2) ways.push({ name: street, matched, coords: cleaned });
       }
     }
-  } else if (nextLines?.length) {
-    // After this many miles the next instruction's road should be there.
-    let bestDist = Infinity;
-    for (const d of [1, -1]) {
-      const trial = trace(d);
-      const dist = nearestDistMiles(nextLines, trial.end);
-      if (dist < bestDist) {
-        bestDist = dist;
-        dir = d;
-      }
+    if (!ways.length) {
+      const osm = await fetchOsmNamedWays(pos, names);
+      if (osm.length) return { ok: true, ways: osm };
     }
-  } else if (dest) {
-    dir = pickCompassDirection(best.way.coords, best.i, null, dest);
+    return { ok: true, ways };
+  } catch (_) {
+    return { ok: true, ways: [], warning: "Local roads unavailable" };
+  }
+}
+
+const nearbyRoadCache = new Map();
+
+/**
+ * Drive one permit leg the way a driver does.
+ * The miles say how far this leg is. The heading is the turn (or the compass
+ * printed on the line). The road name is preferred when it is there, and when
+ * the sign does not match, the road that leaves in that direction is the one
+ * the mileage calls for.
+ */
+async function driveLeg({ pos, miles, heading, names, lrs, preferNamed }) {
+  let cursor = { ...pos };
+  let remaining = Math.max(0, Number(miles) || 0);
+  const coords = [];
+  let roadName = null;
+  const used = new Set();
+  if (heading == null) heading = 0;
+
+  for (let hop = 0; hop < 80 && remaining > 0.04; hop++) {
+    const official = lrsWaysNear(lrs, cursor, 8);
+    const namedOfficial = preferNamed ? official.filter((w) => wayMatchesPermit(names, w)) : [];
+    let pick = pickWayByHeading(namedOfficial, cursor, heading, names, {
+      preferNamed: true,
+      used,
+      wide: hop === 0,
+      stay: hop > 0,
+    });
+    // The miles are not done and the named line stopped. Take the pavement
+    // that continues in the direction this leg is traveling.
+    if (!pick) {
+      const local = await fetchLocalAround(cursor, 2.5);
+      const around = await fetchRoadsAround(cursor, Math.max(2.5, Math.min(6, remaining + 1)));
+      pick = pickWayByHeading(local.concat(around, official), cursor, heading, names, {
+        preferNamed,
+        used,
+        wide: hop === 0,
+        stay: hop > 0,
+      });
+    }
+    if (!pick) break;
+    const traced = traceWayMiles(pick.way, pick.snap, pick.dir, remaining);
+    if (!traced || traced.miles < 0.03) {
+      used.add(pick.way);
+      continue;
+    }
+    for (const p of traced.coords) coords.push([p.lng, p.lat]);
+    cursor = traced.end;
+    remaining -= traced.miles;
+    roadName = pick.way.name || roadName;
+    used.add(pick.way);
   }
 
-  const traced = trace(dir);
-  if (!traced.coords || traced.coords.length < 2) return null;
   return {
-    coords: traced.coords,
-    end: traced.end,
-    snapMiles: best.d,
-    walkedMiles: traced.walkedMiles,
-    name: best.way.name,
+    coords,
+    end: cursor,
+    walkedMiles: Math.max(0, (Number(miles) || 0) - remaining),
+    roadName,
   };
 }
 
-async function fetchOkStreetsNear(pos, miles, names, baseUrl) {
-  const radius = Math.min(18000, Math.max(1600, (Number(miles) || 0.5) * 1609 * 1.3));
-  const params = new URLSearchParams({
-    lat: String(pos.lat),
-    lng: String(pos.lng),
-    radius_m: String(Math.round(radius)),
-    names: names.join("|"),
+function lrsWaysNear(lrs, pos, radiusMi) {
+  const out = [];
+  for (const [code, lines] of Object.entries(lrs?.routes || {})) {
+    for (const coords of lines) {
+      if (!coords?.length) continue;
+      let near = false;
+      const step = Math.max(1, Math.floor(coords.length / 12));
+      for (let i = 0; i < coords.length; i += step) {
+        if (haversineMiles(pos, coords[i]) <= radiusMi) {
+          near = true;
+          break;
+        }
+      }
+      if (near) out.push({ name: code, ref: code, coords });
+    }
+  }
+  return out;
+}
+
+function wayMatchesPermit(names, way) {
+  if (!names?.length || !way) return false;
+  if (names.some((n) => streetNamesMatch(n, way.name) || (way.ref && streetNamesMatch(n, way.ref)))) return true;
+  const codes = names.map((n) => toOdotRoute(n)).filter(Boolean);
+  if (way.ref && codes.includes(way.ref)) return true;
+  const ref = String(way.ref || "")
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "");
+  const label = String(way.name || "")
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "");
+  return names.some((n) => {
+    const plain = String(n)
+      .toUpperCase()
+      .replace(/[^A-Z0-9]/g, "");
+    return plain.length >= 4 && (plain === ref || plain === label);
   });
-  const res = await fetch(`${baseUrl}/api/ok/streets?${params}`);
-  const json = await res.json().catch(() => ({}));
-  if (!res.ok || json.ok === false) throw new Error(json.error || `Local roads fetch failed (${res.status})`);
-  return json;
+}
+
+function projectSegment(pos, a, b) {
+  const dx = b[0] - a[0];
+  const dy = b[1] - a[1];
+  const len2 = dx * dx + dy * dy || 1e-12;
+  let t = ((pos.lng - a[0]) * dx + (pos.lat - a[1]) * dy) / len2;
+  t = Math.max(0, Math.min(1, t));
+  return { t, point: [a[0] + dx * t, a[1] + dy * t] };
+}
+
+function projectWay(way, pos) {
+  const coords = way.coords || [];
+  let best = null;
+  for (let i = 0; i < coords.length - 1; i++) {
+    const proj = projectSegment(pos, coords[i], coords[i + 1]);
+    const d = haversineMiles(pos, proj.point);
+    if (!best || d < best.d) best = { i, t: proj.t, point: proj.point, d };
+  }
+  return best;
+}
+
+/** Bearing a short distance along the way from a projection. */
+function bearingAlong(way, snap, dir) {
+  const coords = way.coords;
+  const next = dir === 1 ? snap.i + 1 : snap.i;
+  if (next < 0 || next >= coords.length) return null;
+  const further = next + dir;
+  const target =
+    haversineMeters(snap.point, coords[next]) < 12 && further >= 0 && further < coords.length
+      ? coords[further]
+      : coords[next];
+  return bearingDeg(snap.point, target);
+}
+
+function pickWayByHeading(ways, pos, heading, names, { preferNamed, used, wide, stay }) {
+  let best = null;
+  for (const way of ways) {
+    if (!way?.coords || way.coords.length < 2 || used.has(way)) continue;
+    const snap = projectWay(way, pos);
+    if (!snap) continue;
+    const named = preferNamed && wayMatchesPermit(names, way);
+    const onPavement = stay && snap.d < 0.12;
+    const limit = named ? (wide ? 2.2 : 0.8) : onPavement ? 0.12 : wide ? 0.45 : 0.25;
+    if (snap.d > limit) continue;
+    for (const dir of [1, -1]) {
+      const bearing = bearingAlong(way, snap, dir);
+      if (bearing == null || heading == null) continue;
+      const diff = angleDiff(bearing, heading);
+      // At the turn, the heading picks the road. Once the truck is on it,
+      // a bend is still this leg until the miles are done.
+      if (diff > (onPavement ? 150 : named ? 75 : 55)) continue;
+      const score = diff + snap.d * 25 - (named ? 28 : 0) - (onPavement ? 40 : 0);
+      if (!best || score < best.score) best = { way, snap, dir, score, named };
+    }
+  }
+  return best;
+}
+
+function traceWayMiles(way, snap, dir, miles) {
+  const coords = way.coords;
+  const target = Math.max(miles, 0.02) * METERS_PER_MILE;
+  const out = [xy(snap.point)];
+  let traveled = 0;
+  let next = dir === 1 ? snap.i + 1 : snap.i;
+  let from = snap.point;
+  while (next >= 0 && next < coords.length && traveled < target) {
+    const b = coords[next];
+    const seg = haversineMeters(from, b);
+    if (seg > 0.4 && traveled + seg >= target) {
+      const t = (target - traveled) / seg;
+      out.push({
+        lng: from[0] + (b[0] - from[0]) * t,
+        lat: from[1] + (b[1] - from[1]) * t,
+      });
+      traveled = target;
+      break;
+    }
+    if (seg > 0.4) {
+      traveled += seg;
+      out.push(xy(b));
+    }
+    from = b;
+    next += dir;
+  }
+  if (out.length < 2 || traveled < 20) return null;
+  return { coords: out, end: out[out.length - 1], miles: traveled / METERS_PER_MILE };
+}
+
+const localRoadCache = new Map();
+
+async function fetchLocalAround(pos, radiusMi) {
+  const key = `${pos.lat.toFixed(2)},${pos.lng.toFixed(2)}`;
+  if (localRoadCache.has(key)) return localRoadCache.get(key);
+  const radius = Math.min(7000, Math.max(2500, radiusMi * 1609));
+  const dlat = radius / 111320;
+  const dlng = radius / (111320 * Math.max(0.2, Math.cos((pos.lat * Math.PI) / 180)));
+  const params = new URLSearchParams({
+    where: "1=1",
+    geometry: `${pos.lng - dlng},${pos.lat - dlat},${pos.lng + dlng},${pos.lat + dlat}`,
+    geometryType: "esriGeometryEnvelope",
+    inSR: "4326",
+    spatialRel: "esriSpatialRelIntersects",
+    outFields: "STREETNAME",
+    returnGeometry: "true",
+    outSR: "4326",
+    f: "geojson",
+    resultRecordCount: "2000",
+  });
+  try {
+    const res = await fetch(`${OK_LOCAL_QUERY}?${params}`);
+    const gj = await res.json().catch(() => ({}));
+    const ways = [];
+    for (const feat of gj.features || []) {
+      const geom = feat.geometry || {};
+      const parts =
+        geom.type === "LineString" ? [geom.coordinates] : geom.type === "MultiLineString" ? geom.coordinates : [];
+      for (const part of parts) {
+        const coords = (part || []).filter((p) => p && p.length >= 2).map((p) => [Number(p[0]), Number(p[1])]);
+        if (coords.length >= 2) ways.push({ name: feat.properties?.STREETNAME || "", ref: "", coords });
+      }
+    }
+    localRoadCache.set(key, ways);
+    return ways;
+  } catch (_) {
+    localRoadCache.set(key, []);
+    return [];
+  }
+}
+
+async function fetchRoadsAround(pos, radiusMi) {
+  const key = `${pos.lat.toFixed(2)},${pos.lng.toFixed(2)}`;
+  if (nearbyRoadCache.has(key)) return nearbyRoadCache.get(key);
+  const meters = Math.round(Math.min(9000, Math.max(2500, radiusMi * 1609)));
+  const query =
+    `[out:json][timeout:20];way["highway"~"motorway|trunk|primary|secondary|tertiary|unclassified|residential|motorway_link|trunk_link|primary_link|secondary_link"](around:${meters},${pos.lat},${pos.lng});out geom;`;
+  const body = new URLSearchParams({ data: query });
+  const endpoints = [
+    "https://overpass.openstreetmap.fr/api/interpreter",
+    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
+  ];
+  for (const url of endpoints) {
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8" },
+        body,
+        signal: AbortSignal.timeout(20000),
+      });
+      if (!res.ok) continue;
+      const json = await res.json();
+      const ways = [];
+      for (const el of json.elements || []) {
+        const tags = el.tags || {};
+        const coords = (el.geometry || [])
+          .filter((g) => g.lon != null && g.lat != null)
+          .map((g) => [Number(g.lon), Number(g.lat)]);
+        if (coords.length < 2) continue;
+        ways.push({ name: tags.name || tags.ref || "", ref: tags.ref || "", coords });
+      }
+      nearbyRoadCache.set(key, ways);
+      return ways;
+    } catch (_) {
+      /* next server */
+    }
+  }
+  nearbyRoadCache.set(key, []);
+  return [];
+}
+
+/** Roads the state layer does not label, looked up by the permit's own name. */
+async function fetchOsmNamedWays(pos, names) {
+  const needles = localNeedles(names);
+  if (!needles.length) return [];
+  const token = needles.slice().sort((a, b) => b.length - a.length)[0].replace(/[^A-Za-z0-9]/g, "");
+  if (token.length < 3) return [];
+  const query =
+    `[out:json][timeout:18];way["highway"]["name"~"${token}",i](around:12000,${pos.lat},${pos.lng});out geom;`;
+  const body = new URLSearchParams({ data: query });
+  const endpoints = [
+    "https://overpass.openstreetmap.fr/api/interpreter",
+    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
+  ];
+  for (const url of endpoints) {
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8" },
+        body,
+        signal: AbortSignal.timeout(15000),
+      });
+      if (!res.ok) continue;
+      const json = await res.json();
+      const ways = [];
+      for (const el of json.elements || []) {
+        const street = el.tags?.name || "";
+        const matched = names.find((n) => streetNamesMatch(n, street));
+        if (!matched) continue;
+        const coords = (el.geometry || [])
+          .filter((g) => g.lon != null && g.lat != null)
+          .map((g) => [Number(g.lon), Number(g.lat)]);
+        if (coords.length >= 2) ways.push({ name: street, matched, coords });
+      }
+      if (ways.length) return ways;
+    } catch (_) {
+      /* try the next map server */
+    }
+  }
+  return [];
 }
 
 /**
@@ -751,7 +1046,7 @@ async function fetchOkStreetsNear(pos, miles, names, baseUrl) {
 function walkHighway(lines, from, compass, miles, dest, { strict = false, maxSnapMi = 0.45, joinMi = 2.5 } = {}) {
   const targetMeters = Math.max(miles, 0.05) * METERS_PER_MILE;
   const startPt = [from.lng, from.lat];
-  const joinMeters = Math.max(joinMi, 1.2) * METERS_PER_MILE;
+  const joinMeters = Math.max(joinMi, 0.4) * METERS_PER_MILE;
 
   let best = null;
   for (let li = 0; li < lines.length; li++) {
@@ -784,9 +1079,9 @@ function walkHighway(lines, from, compass, miles, dest, { strict = false, maxSna
         for (const tryDir of [1, -1]) {
           const nj = j + tryDir;
           if (nj < 0 || nj >= other.length) continue;
-          if (compass && !segmentRespectsCompass(other[j], other[nj], compass)) continue;
+          if (compass && !segmentRespectsCompass(other[j], other[nj], compass, 45)) continue;
           // Prefer forward progress in the travel direction.
-          if (compass && d > 0.15 * METERS_PER_MILE && !segmentRespectsCompass(tip, other[nj], compass)) {
+          if (compass && d > 0.15 * METERS_PER_MILE && !segmentRespectsCompass(tip, other[nj], compass, 45)) {
             continue;
           }
           if (!jump || d < jump.d) {
@@ -815,7 +1110,20 @@ function walkHighway(lines, from, compass, miles, dest, { strict = false, maxSna
         // Dead end on this piece — join another piece ahead.
         const jump = tryJoin(a);
         if (!jump) break;
-        if (jump.d > targetMeters - traveled + 0.05 * METERS_PER_MILE) break;
+        if (jump.d > targetMeters - traveled + 0.15 * METERS_PER_MILE) {
+          const remain = targetMeters - traveled;
+          if (remain > 1 && jump.d <= 5 * METERS_PER_MILE) {
+            const tipPt = xy(a);
+            const destPt = xy(lines[jump.li][jump.j]);
+            const t = remain / jump.d;
+            out.push({
+              lng: tipPt.lng + (destPt.lng - tipPt.lng) * t,
+              lat: tipPt.lat + (destPt.lat - tipPt.lat) * t,
+            });
+            traveled = targetMeters;
+          }
+          break;
+        }
         traveled += jump.d;
         out.push(xy(lines[jump.li][jump.j]));
         line = lines[jump.li];
@@ -844,8 +1152,21 @@ function walkHighway(lines, from, compass, miles, dest, { strict = false, maxSna
     const tip = line[i];
     const jump = tryJoin(tip);
     if (!jump) break;
-    // Do not leap past the mileage column on a long LRS gap.
-    if (jump.d > targetMeters - traveled + 0.05 * METERS_PER_MILE) break;
+    // Same road continues past a gap in the centerline. Do not walk farther than this step's miles.
+    if (jump.d > targetMeters - traveled + 0.15 * METERS_PER_MILE) {
+      const remain = targetMeters - traveled;
+      if (remain > 1 && jump.d <= 5 * METERS_PER_MILE) {
+        const tipPt = xy(tip);
+        const destPt = xy(lines[jump.li][jump.j]);
+        const t = remain / jump.d;
+        out.push({
+          lng: tipPt.lng + (destPt.lng - tipPt.lng) * t,
+          lat: tipPt.lat + (destPt.lat - tipPt.lat) * t,
+        });
+        traveled = targetMeters;
+      }
+      break;
+    }
     traveled += jump.d;
     out.push(xy(lines[jump.li][jump.j]));
     line = lines[jump.li];
@@ -885,25 +1206,15 @@ function pickCompassDirection(line, index, compass, dest) {
   return 1;
 }
 
-function segmentRespectsCompass(a, b, compass) {
+function segmentRespectsCompass(a, b, compass, limitDeg = 100) {
+  if (!compass) return true;
   const aa = Array.isArray(a) ? a : [a.lng, a.lat];
   const bb = Array.isArray(b) ? b : [b.lng, b.lat];
-  const dLng = bb[0] - aa[0];
-  const dLat = bb[1] - aa[1];
-  // Allow tiny noise; require dominant axis matches.
-  const eps = 1e-7;
-  switch (compass) {
-    case "NB":
-      return dLat >= -eps;
-    case "SB":
-      return dLat <= eps;
-    case "EB":
-      return dLng >= -eps;
-    case "WB":
-      return dLng <= eps;
-    default:
-      return true;
-  }
+  // A curve on the same highway wiggles. Only reject a real turnaround.
+  if (haversineMeters(aa, bb) < 12) return true;
+  const desired = { NB: 0, EB: 90, SB: 180, WB: 270 }[compass];
+  if (desired == null) return true;
+  return angleDiff(bearingDeg(aa, bb), desired) <= limitDeg;
 }
 
 function directionOk(from, to, compass) {
@@ -975,15 +1286,51 @@ export function toOdotRoute(road) {
   return `${prefix}${num}${suffix}`;
 }
 
-async function fetchOkLrs(routes, bbox, baseUrl) {
-  const params = new URLSearchParams({
-    routes: routes.join(","),
-    bbox: bbox.join(","),
-  });
-  const res = await fetch(`${baseUrl}/api/ok/lrs?${params}`);
-  const json = await res.json().catch(() => ({}));
-  if (!res.ok || !json.ok) throw new Error(json.error || `ODOT LRS fetch failed (${res.status})`);
-  return json;
+async function fetchOkLrs(routes) {
+  const codes = [...new Set(routes.map((r) => String(r).replace(/[^A-Za-z0-9]/g, "")).filter(Boolean))];
+  if (!codes.length) return { ok: true, routes: {} };
+  const where = `ODOTROUTE IN (${codes.map((c) => `'${c}'`).join(",")})`;
+  const features = [];
+  let offset = 0;
+  for (let page = 0; page < 8; page++) {
+    const params = new URLSearchParams({
+      where,
+      outFields: "ODOTROUTE,MLENGTH",
+      returnGeometry: "true",
+      outSR: "4326",
+      f: "geojson",
+      resultOffset: String(offset),
+      resultRecordCount: "2000",
+    });
+    const res = await fetch(`${OK_LRS_QUERY}?${params}`);
+    const gj = await res.json().catch(() => ({}));
+    if (!res.ok || gj.error) {
+      const msg = gj.error?.message || gj.error || `ODOT highways failed (${res.status})`;
+      throw new Error(typeof msg === "string" ? msg : "ODOT highways failed");
+    }
+    const batch = gj.features || [];
+    features.push(...batch);
+    if (!gj.exceededTransferLimit || !batch.length) break;
+    offset += batch.length;
+  }
+
+  const byRoute = {};
+  for (const feat of features) {
+    const code = feat.properties?.ODOTROUTE;
+    if (!code) continue;
+    const geom = feat.geometry || {};
+    const parts =
+      geom.type === "LineString" ? [geom.coordinates] : geom.type === "MultiLineString" ? geom.coordinates : [];
+    for (const line of parts) {
+      const cleaned = (line || [])
+        .filter((p) => p && p.length >= 2)
+        .map((p) => [Number(p[0]), Number(p[1])]);
+      if (cleaned.length < 2) continue;
+      if (!byRoute[code]) byRoute[code] = [];
+      byRoute[code].push(cleaned);
+    }
+  }
+  return { ok: true, routes: byRoute };
 }
 
 async function mapboxDrivePair(from, to, token) {
