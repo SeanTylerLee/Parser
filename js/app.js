@@ -11,7 +11,7 @@ import {
 } from "./map.js";
 import { extractPermitId, fetchTxprosPermit, dirsToText, txprosUrl } from "./txpros.js";
 import { parseOkPermitText, OK_PARSER_VERSION, looksLikeOkPermit } from "./ok-permit-parser.js";
-import { buildOkRoute, fetchSafehaulPermit, safehaulViewerUrl } from "./ok-route.js";
+import { buildOkRoute, fetchSafehaulPermit, safehaulViewerUrl } from "./ok-route.js?v=ok38-concurrent";
 
 const MAPBOX_TOKEN =
   "pk.eyJ1Ijoic2VhbmxlZTkyIiwiYSI6ImNtZTAyeG0wbzAwamgybHE2cmwzenJtM2cifQ.DE8FeoDvc3EzuyR5uPopzA";
@@ -361,7 +361,7 @@ function renderTx(result, txpros) {
   }
 }
 
-function renderOk(parsed) {
+function renderOk(parsed, checks) {
   el.meta.innerHTML = "";
   el.steps.innerHTML = "";
   el.resultPanel.hidden = false;
@@ -387,12 +387,32 @@ function renderOk(parsed) {
   ];
   fillMeta(rows);
 
-  for (const step of parsed.steps || []) {
+  const byIndex = new Map((checks || []).map((c) => [c.index, c]));
+  (parsed.steps || []).forEach((step, i) => {
     const li = document.createElement("li");
+    const check = byIndex.get(i);
+    if (check?.both_fail) li.className = "bad";
+    else if (check && !check.miles_ok) li.className = "weak";
+    else if (check) li.className = "ok";
     const tag = step.leg_miles != null ? `${step.leg_miles} mi` : step.label || "Dir";
-    li.innerHTML = `<span class="tag">${escapeHtml(String(tag))}</span><span>${escapeHtml(step.instruction)}</span>`;
+    const note = check ? `<span class="miles">${escapeHtml(stepCheckText(check))}</span>` : "";
+    li.innerHTML = `<span class="tag">${escapeHtml(String(tag))}</span><span>${escapeHtml(step.instruction)}</span>${note}`;
     el.steps.appendChild(li);
+  });
+}
+
+function stepCheckText(check) {
+  const miles = check.miles_ok
+    ? "miles match"
+    : `miles off (${Number(check.walked_mi).toFixed(1)} vs ${check.miles})`;
+  // Permit label vs map label is not a failure — show what was drawn.
+  let road = "no road drawn";
+  if (check.road_ok === true || (check.used_road && check.miles_ok)) {
+    road = check.used_road ? `on ${check.used_road}` : "road drawn";
+  } else if (check.road_ok == null) {
+    road = "no road name on step";
   }
+  return `${miles} · ${road}`;
 }
 
 function fillMeta(rows) {
@@ -492,6 +512,7 @@ async function showOkMap() {
       destLabel: lastParse.destination_text || "Destination",
       pins: lastOkRoute.pins,
     });
+    renderOk(lastParse, lastOkRoute.step_checks);
     fillMetaPoints(lastOkRoute.point_count);
     renderOkWarnings(lastOkRoute);
 
@@ -522,7 +543,11 @@ function renderOkWarnings(route) {
   const conf = (route?.confidence || "medium").toUpperCase();
   const body = warnings.length
     ? warnings
-    : ["Best-effort Oklahoma route — verify against the permit directions."];
+    : [
+        route?.confidence === "low"
+          ? "A step did not draw for the stated miles, so the route is not complete."
+          : "A step’s miles are off. Map road names can differ from the permit — miles are the check.",
+      ];
   box.innerHTML = `<strong>Confidence: ${escapeHtml(conf)}</strong>${body
     .map((w) => `<div>${escapeHtml(w)}</div>`)
     .join("")}`;
@@ -552,8 +577,12 @@ function fillMetaPoints(n) {
     [
       "Confidence",
       lastOkRoute?.confidence === "high"
-        ? "HIGH (from permit instructions)"
-        : (lastOkRoute?.confidence || "—").toString().toUpperCase(),
+        ? "HIGH — miles match on each step"
+        : lastOkRoute?.confidence === "low"
+          ? "LOW — a step did not draw the stated miles"
+          : lastOkRoute?.confidence === "medium"
+            ? "MEDIUM — a step’s miles are off"
+            : (lastOkRoute?.confidence || "—").toString().toUpperCase(),
     ],
     [
       "From",

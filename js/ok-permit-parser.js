@@ -7,7 +7,7 @@
  * - "(Outbound)" suffixes, multi-page direction tables
  */
 
-export const OK_PARSER_VERSION = "ok-directions-v4";
+export const OK_PARSER_VERSION = "ok-directions-v5";
 
 const PERMIT_NO_RE = /Permit\s*Number:\s*(\d{10,})/i;
 const APPROX_MI_RE = /Approximate\s*Mileage:\s*([\d.]+)\s*mi/i;
@@ -199,20 +199,62 @@ function annotateStep(leg_miles, instruction) {
     const trail = instruction.match(/\b(NB|SB|EB|WB)\b/i);
     if (trail) compass = trail[1].toUpperCase();
   }
+  if (!compass) {
+    const lead = instruction.match(/\b(?:Continue|Turn|Bear)\s+(NORTH|SOUTH|EAST|WEST)\b/i);
+    if (lead) compass = lead[1].toUpperCase();
+  }
   if (compass === "N" || compass === "NORTH") compass = "NB";
   if (compass === "S" || compass === "SOUTH") compass = "SB";
   if (compass === "E" || compass === "EAST") compass = "EB";
   if (compass === "W" || compass === "WEST") compass = "WB";
+
+  const aliases = extractAliases(instruction, road);
 
   return {
     leg_miles,
     instruction,
     maneuver,
     road,
+    aliases,
     compass,
     label: maneuver || "Dir",
     displayText: instruction,
   };
+}
+
+function extractAliases(instruction, primary) {
+  const aliases = [];
+  const seen = new Set();
+  const add = (name) => {
+    const cleaned = cleanAlias(name);
+    if (!cleaned) return;
+    const key = cleaned.toLowerCase();
+    if (primary && key === primary.toLowerCase()) return;
+    if (seen.has(key)) return;
+    seen.add(key);
+    aliases.push(cleaned);
+  };
+  for (const match of String(instruction || "").matchAll(/\(([^)]+)\)/g)) {
+    const inner = match[1];
+    if (/contact local|unknown road|^\s*ramp\s*$/i.test(inner)) continue;
+    for (const part of inner.split(",")) add(part);
+  }
+  return aliases;
+}
+
+function cleanAlias(raw) {
+  let s = String(raw || "").replace(/\s+/g, " ").trim();
+  if (!s || /contact local|unknown road|^ramp$/i.test(s)) return null;
+  if (/^(NB|SB|EB|WB|NORTH|SOUTH|EAST|WEST)$/i.test(s)) return null;
+  const us = s.match(/^US\s+Highway\s+(\d+)/i);
+  if (us) return `US-${us[1]}`;
+  const stateHwy = s.match(/^State\s+Highway\s+(\d+)/i);
+  if (stateHwy) return `OK-${stateHwy[1]}`;
+  // "S Highway 6" / "Highway 64 N" repeat the numbered route. Not a street.
+  if (/^[NSEW]\s+Highway\s+\d+/i.test(s) || /^Highway\s+\d+/i.test(s)) return null;
+  if (/^(I|IH|US|OK|SH)\s*-?\s*\d+/i.test(s)) return normalizeRoad(s);
+  if (!/[A-Za-z]/.test(s) || s.length < 3) return null;
+  return s.replace(/\s+(NB|SB|EB|WB)$/i, "").trim();
 }
 
 function normalizeRoad(raw) {
@@ -222,9 +264,13 @@ function normalizeRoad(raw) {
   s = s.replace(/^IH\s*-?\s*/i, "I-");
   s = s.replace(/^(I|US|OK|SH)\s+(\d+)/i, (_, p, n) => `${p.toUpperCase()}-${n}`);
   s = s.replace(/^(I|US|OK|SH)-(\d+)/i, (_, p, n) => `${p.toUpperCase()}-${n}`);
+  s = s.replace(/\s+(NB|SB|EB|WB|[NSEW])$/i, "").trim();
   if (/^(I|US|OK|SH)-\d+/i.test(s)) {
-    const m = s.match(/^((?:I|US|OK|SH)-\d+[A-Z]?(?:\s*Alt(?:\s*[NS])?)?)/i);
-    if (m) return m[1].replace(/\s+/g, " ").replace(/\s*Alt.*/i, "");
+    const m = s.match(/^((?:I|US|OK|SH)-\d+[A-Z]?)/i);
+    if (m) {
+      const base = m[1].replace(/^(I|US|OK|SH)-(\d+)/i, (_, p, n) => `${p.toUpperCase()}-${n}`);
+      return /\bAlt\b/i.test(s) ? `${base} Alt` : base;
+    }
   }
   return s;
 }
